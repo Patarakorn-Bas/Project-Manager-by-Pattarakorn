@@ -2,11 +2,11 @@
    คุมงานก่อสร้าง (PWA) — ใช้งานคนเดียว ข้อมูลเก็บในเครื่อง (IndexedDB)
    ===================================================================== */
 'use strict';
-var APP_VERSION = '1.0.0';
+var APP_VERSION = '2.0.0';
 
 /* ---------------- IndexedDB ---------------- */
-var DB_NAME = 'sitecontrol', DB_VER = 1;
-var STORES = ['projects', 'tasks', 'progress', 'daily', 'weekly', 'submittals', 'files', 'meta'];
+var DB_NAME = 'sitecontrol', DB_VER = 2;
+var STORES = ['projects', 'tasks', 'progress', 'daily', 'weekly', 'submittals', 'files', 'meta', 'installments', 'vos', 'eots'];
 var _db = null;
 function openDB() {
   if (_db) return Promise.resolve(_db);
@@ -85,14 +85,48 @@ function parseDateAny(s) {
 }
 
 /* ---------------- state ---------------- */
-var S = { projects: [], P: null, tasks: [], progress: [], daily: [], weekly: [], submittals: [], files: [], route: [], urls: {}, deferredInstall: null };
+var S = { projects: [], P: null, tasks: [], progress: [], daily: [], weekly: [], submittals: [], files: [], installments: [], vos: [], eots: [], route: [], urls: {}, deferredInstall: null, finTab: 'inst' };
 
 /* ---------------- calculations (ยกมาจากเว็บแอปที่ทดสอบแล้ว) ---------------- */
 function parts() { return (S.P && S.P.parts) || []; }
 function cats() { return (S.P && S.P.cats) || []; }
 function projStart() { return D(S.P.start) || today(); }
 function projDur() { return Math.max(1, num(S.P.duration)); }
-function projEnd() { return addDays(projStart(), projDur() + num(S.P.eot_days) - 1); }
+function eotApproved(eots) { return (eots || S.eots || []).reduce(function (a, e) { return a + (e.status === 'อนุมัติ' || e.status === 'อนุมัติบางส่วน' ? num(e.days_approved) : 0); }, 0); }
+function eotTotal(eots) { return eotApproved(eots) + num(S.P.eot_days); }
+function projEnd(eots) { return addDays(projStart(), projDur() + eotTotal(eots) - 1); }
+function voNet(vos) { return (vos || S.vos || []).reduce(function (a, v) { if (v.status !== 'อนุมัติ') return a; var x = v.approved_amount !== '' && v.approved_amount != null ? num(v.approved_amount) : num(v.amount); return a + (v.type === 'งานลด' ? -x : x); }, 0); }
+var K_DEFAULT = { a: 0.25, c: [0.15, 0.10, 0.40, 0.10, 0], io: [100, 100, 100, 100, 0], n: ['I ดัชนีราคาผู้บริโภค', 'C ดัชนีราคาซีเมนต์', 'M ดัชนีราคาวัสดุก่อสร้าง', 'S ดัชนีราคาเหล็ก', ''] };
+function fin() { var f = S.P.fin || {}; return { adv: f.adv != null ? num(f.adv) : 15, ret: f.ret != null ? num(f.ret) : 5, kUse: !!f.kUse, kThr: f.kThr != null ? num(f.kThr) : 4, k: f.k || K_DEFAULT,
+  ldRate: f.ldRate != null ? num(f.ldRate) : 0.10, ldMin: f.ldMin != null ? num(f.ldMin) : 100, ldCap: f.ldCap != null ? num(f.ldCap) : 10 }; }
+function kOf(inst) {
+  var F = fin(); if (!F.kUse) return null; var k = F.k, it = inst.it || [], K = num(k.a), used = 0;
+  for (var i = 0; i < 5; i++) { if (num(k.c[i]) > 0) { if (!num(it[i]) || !num(k.io[i])) return null; K += num(k.c[i]) * num(it[i]) / num(k.io[i]); used++; } }
+  return used ? K : null;
+}
+function payOf(inst) {
+  var F = fin(), amt = num(inst.amount) + num(inst.vo_amount), K = kOf(inst), thr = F.kThr / 100, kadj = 0;
+  if (K != null) kadj = K > 1 + thr ? amt * (K - 1 - thr) : K < 1 - thr ? amt * (K - 1 + thr) : 0;
+  var adv = amt * F.adv / 100, ret = amt * F.ret / 100, ld = num(inst.ld);
+  return { amt: amt, K: K, kadj: kadj, adv: adv, ret: ret, ld: ld, net: amt + kadj - adv - ret - ld };
+}
+function instStatus(i) {
+  var d = today(), due = D(i.due);
+  if (i.accepted) return { k: 'ok', t: 'ตรวจรับแล้ว' };
+  if (i.submitted) return { k: 'warn', t: 'ส่งมอบแล้ว รอตรวจรับ' };
+  if (!due) return { k: 'na', t: '-' };
+  if (d > due) return { k: 'bad', t: 'เกินกำหนด ' + diffDays(d, due) + ' วัน' };
+  if (diffDays(due, d) <= 14) return { k: 'warn', t: 'ใกล้ครบกำหนด (' + diffDays(due, d) + ' วัน)' };
+  return { k: 'na', t: 'ยังไม่ถึงกำหนด' };
+}
+function ldInfo() {
+  var F = fin(), d = today(), per = Math.max(F.ldMin, F.ldRate / 100 * num(S.P.bac)), end = projEnd();
+  var ac = actualNow(), el = Math.max(1, diffDays(d, projStart()) + 1), rate = ac / el;
+  var fEnd = ac >= 1 ? d : (rate > 0 ? addDays(d, Math.ceil((1 - ac) / rate)) : null);
+  var late = Math.max(0, diffDays(d, end)), fDelay = fEnd ? Math.max(0, diffDays(fEnd, end)) : null;
+  var fLd = fDelay == null ? null : fDelay * per, cap = F.ldCap / 100 * num(S.P.bac);
+  return { per: per, late: late, incurred: late * per, fEnd: fEnd, fDelay: fDelay, fLd: fLd, overCap: fLd != null && cap > 0 && fLd > cap };
+}
 function weightFn(tasks) {
   tasks = tasks || S.tasks;
   var sb = tasks.reduce(function (a, t) { return a + num(t.boq); }, 0);
@@ -163,24 +197,61 @@ function projectSummary(p, tasks) {
   var keep = S.P; S.P = p;
   try {
     var d = today(), pl = planAt(d, false, tasks), ac = actualNow(tasks);
-    return { plan: pl, act: ac, st: spiState(ac, pl), end: projEnd(), n: tasks.length };
+    return { plan: pl, act: ac, st: spiState(ac, pl), end: projEnd(p._eots || []), n: tasks.length };
   } finally { S.P = keep; }
 }
 
+/* ---------------- icons (line icons) ---------------- */
+var ICONS = {
+  dash: '<path d="M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z"/>',
+  list: '<path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/>',
+  day: '<path d="M9 3h6v3H9zM7 4.5H5V21h14V4.5h-2M8 11h8M8 15h8M8 19h5"/>',
+  week: '<path d="M4 6h16v15H4zM4 10h16M8 3v5M16 3v5M8 14h2M12 14h2M16 14h0M8 17h2M12 17h2"/>',
+  box: '<path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5zM3 7.5l9 4.5 9-4.5M12 12v9"/>',
+  money: '<path d="M3 6h18v12H3zM12 9.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5M6.5 9v6M17.5 9v6"/>',
+  settings: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+  home: '<path d="M3 11 12 4l9 7M5 10v10h14V10M10 20v-6h4v6"/>',
+  print: '<path d="M7 8V3h10v5M5 8h14v8H5zM7 14h10v7H7z"/>',
+  download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
+  upload: '<path d="M12 20V9M7 14l5-5 5 5M5 4h14"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  camera: '<path d="M4 8h4l2-3h4l2 3h4v11H4z"/><circle cx="12" cy="13" r="3.5"/>',
+  spark: '<path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9zM19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/>',
+  file: '<path d="M6 3h9l4 4v14H6zM15 3v4h4M9 12h6M9 16h6"/>',
+  excel: '<path d="M6 3h9l4 4v14H6zM15 3v4h4M9 11l5 6M14 11l-5 6"/>',
+  backup: '<path d="M4 6c0-2.5 16-2.5 16 0v12c0 2.5-16 2.5-16 0zM4 6c0 2.5 16 2.5 16 0M4 12c0 2.5 16 2.5 16 0"/>',
+  archive: '<path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4"/>',
+  trash: '<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>',
+  edit: '<path d="M4 20h4L20 8l-4-4L4 16zM14 6l4 4"/>',
+  chevl: '<path d="m15 5-7 7 7 7"/>', chevr: '<path d="m9 5 7 7-7 7"/>',
+  alert: '<path d="M12 3 22 20H2zM12 10v4M12 17v.5"/>',
+  check: '<path d="m5 12 5 5 9-10"/>',
+  folder: '<path d="M3 6h7l2 2h9v11H3z"/>',
+  menu: '<path d="M4 6h16M4 12h16M4 18h16"/>'
+};
+function ic(n) { return '<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">' + (ICONS[n] || '') + '</svg>'; }
+function pageHead(title, sub, actions) {
+  var crumb = S.P ? '<a href="#/">โครงการทั้งหมด</a> › <a href="#/p/' + S.P.id + '">' + esc(S.P.name) + '</a>' : '<a href="#/">โครงการทั้งหมด</a>';
+  return '<div class="phead"><div class="crumb">' + crumb + '</div><div class="between"><div><h1>' + title + '</h1>' + (sub ? '<p>' + sub + '</p>' : '') + '</div>' +
+    (actions ? '<div class="row noprint">' + actions + '</div>' : '') + '</div></div>';
+}
 /* ---------------- routing & shell ---------------- */
 function go(path) { if (location.hash !== '#' + path) location.hash = path; else render(); }
 function parseRoute() { return (location.hash.replace(/^#\/?/, '') || '').split('/').filter(Boolean).map(decodeURIComponent); }
-var NAV_P = [['dash', '📊', 'ภาพรวม'], ['tasks', '🧱', 'ผลงาน'], ['daily', '📝', 'รายวัน'], ['weekly', '🗓️', 'รายสัปดาห์'], ['mat', '📦', 'วัสดุ']];
+var NAV_P = [['dash', 'dash', 'ภาพรวมโครงการ', 'ภาพรวม'], ['tasks', 'list', 'แผนงานและผลงาน', 'ผลงาน'], ['daily', 'day', 'รายงานประจำวัน', 'รายวัน'], ['weekly', 'week', 'รายงานรายสัปดาห์', 'สัปดาห์'], ['mat', 'box', 'ขออนุมัติวัสดุ', 'วัสดุ'], ['fin', 'money', 'สัญญาและการเงิน', 'สัญญา']];
 function renderNav() {
   var r = S.route, inP = r[0] === 'p' && S.P, cur = inP ? (r[2] || 'dash') : (r[0] || 'home');
-  if (cur === 'print') cur = r[3] === 'mat' ? 'mat' : r[3];
-  var items = inP ? NAV_P.map(function (n) { return ['/p/' + S.P.id + (n[0] === 'dash' ? '' : '/' + n[0]), n[1], n[2], n[0]]; })
-    : [['/', '🏠', 'โครงการ', 'home'], ['/app', '⚙️', 'ตั้งค่าแอป', 'app']];
-  var btn = function (n) { return '<button data-go="' + esc(n[0]) + '" class="' + (cur === n[3] ? 'on' : '') + '"' + (cur === n[3] ? ' aria-current="page"' : '') + '><b>' + n[1] + '</b>' + esc(n[2]) + '</button>'; };
-  $('#bottomNav').innerHTML = items.map(btn).join('');
-  $('#sideNav').innerHTML = items.map(btn).join('') + (inP ? '<div class="sep"></div>' + btn(['/p/' + S.P.id + '/set', '⚙️', 'ตั้งค่าโครงการ', 'set']) + btn(['/', '🏠', 'ทุกโครงการ', 'home']) : '');
-  $('#brandText').innerHTML = inP ? esc(S.P.name) + '<small>' + (S.P.type === 'multi' ? 'โครงการหลายงานส่วน' : 'งานก่อสร้าง') + '</small>' : 'คุมงานก่อสร้าง<small>ทุกโครงการ</small>';
-  document.title = inP ? S.P.name + ' – คุมงานก่อสร้าง' : 'คุมงานก่อสร้าง';
+  if (cur === 'print') cur = { mat: 'mat', pay: 'fin' }[r[3]] || r[3];
+  var items = inP ? NAV_P.map(function (n) { return ['/p/' + S.P.id + (n[0] === 'dash' ? '' : '/' + n[0]), n[1], n[2], n[0], n[3]]; })
+    : [['/', 'folder', 'โครงการทั้งหมด', 'home', 'โครงการ'], ['/app', 'settings', 'ตั้งค่าและสำรองข้อมูล', 'app', 'ตั้งค่า']];
+  var btn = function (n, short) { return '<button data-go="' + esc(n[0]) + '" class="' + (cur === n[3] ? 'on' : '') + '"' + (cur === n[3] ? ' aria-current="page"' : '') + '>' + ic(n[1]) + '<span>' + esc(short ? n[4] || n[2] : n[2]) + '</span></button>'; };
+  $('#bottomNav').innerHTML = items.map(function (n) { return btn(n, true); }).join('');
+  $('#sideNav').innerHTML = (inP ? '<div class="grp">โครงการ</div>' : '<div class="grp">เมนู</div>') + items.map(function (n) { return btn(n); }).join('') +
+    (inP ? '<div class="sep"></div>' + btn(['/p/' + S.P.id + '/set', 'settings', 'ตั้งค่าโครงการ', 'set']) + btn(['/', 'folder', 'โครงการทั้งหมด', 'home']) + btn(['/app', 'backup', 'ตั้งค่าและสำรองข้อมูล', 'app']) : '') +
+    '<div class="foot">ระบบควบคุมงานก่อสร้าง v' + APP_VERSION + '</div>';
+  $('#brandText').innerHTML = inP ? esc(S.P.name) + '<small>' + esc([S.P.contract_no ? 'สัญญาเลขที่ ' + S.P.contract_no : '', S.P.type === 'multi' ? 'โครงการหลายงานส่วน' : 'งานก่อสร้าง'].filter(Boolean).join(' • ')) + '</small>' : 'ระบบควบคุมงานก่อสร้าง<small>CONSTRUCTION SUPERVISION</small>';
+  document.title = inP ? S.P.name + ' – ระบบควบคุมงานก่อสร้าง' : 'ระบบควบคุมงานก่อสร้าง';
 }
 var chart = null;
 async function render() {
@@ -192,7 +263,7 @@ async function render() {
       if (!S.P || S.P.id !== r[1]) await loadProject(r[1]);
       if (!S.P) { go('/'); return; }
       var v = r[2] || 'dash';
-      var views = { dash: vDash, tasks: vTasks, daily: vDaily, weekly: vWeekly, mat: vMat, set: vProjSet, print: vPrint };
+      var views = { dash: vDash, tasks: vTasks, daily: vDaily, weekly: vWeekly, mat: vMat, fin: vFin, set: vProjSet, print: vPrint };
       renderNav();
       m.innerHTML = await (views[v] || vDash)(r.slice(3));
     } else {
@@ -207,8 +278,8 @@ function after(fn) { _after.push(fn); }
 function afterRender() { var q = _after; _after = []; q.forEach(function (f) { try { f(); } catch (e) { console.error(e); } }); hydrateImgs(); }
 async function loadProject(id) {
   var p = await DB.get('projects', id); S.P = p || null; if (!p) return;
-  var res = await Promise.all(['tasks', 'progress', 'daily', 'weekly', 'submittals', 'files'].map(function (s) { return DB.byProject(s, id); }));
-  S.tasks = res[0]; S.progress = res[1]; S.daily = res[2]; S.weekly = res[3]; S.submittals = res[4]; S.files = res[5];
+  var res = await Promise.all(['tasks', 'progress', 'daily', 'weekly', 'submittals', 'files', 'installments', 'vos', 'eots'].map(function (s) { return DB.byProject(s, id); }));
+  S.tasks = res[0]; S.progress = res[1]; S.daily = res[2]; S.weekly = res[3]; S.submittals = res[4]; S.files = res[5]; S.installments = res[6]; S.vos = res[7]; S.eots = res[8];
   Object.keys(S.urls).forEach(function (k) { URL.revokeObjectURL(S.urls[k]); }); S.urls = {};
 }
 async function saveProject() { S.P.updated = new Date().toISOString(); await DB.put('projects', S.P); }
@@ -228,7 +299,8 @@ function modal(html, onOk, okText, wide) {
     ok.disabled = true;
     try { if ((await onOk(bg)) !== false) close(); } catch (e) { toast(e.message, true); } finally { ok.disabled = false; }
   });
-  var first = bg.querySelector('input:not([type=hidden]):not([disabled]),select,textarea'); if (first) setTimeout(function () { first.focus(); }, 30);
+  // โฟกัสช่องแรกให้อัตโนมัติ – แต่ไม่แย่งโฟกัสถ้าผู้ใช้เริ่มกรอกช่องอื่นแล้ว (ป้องกันค่าที่พิมพ์หาย)
+  var first = bg.querySelector('input:not([type=hidden]):not([disabled]),select,textarea'); if (first) setTimeout(function () { if (!bg.contains(document.activeElement)) first.focus(); }, 30);
   return bg;
 }
 function val(bg, id) { var e = bg.querySelector('#' + id); return e ? String(e.value).trim() : ''; }
@@ -289,14 +361,14 @@ async function addFiles(kind, ref, list, allowPdf) {
 }
 function filesBlock(kind, ref, editable, allowPdf) {
   var list = filesOf(kind, ref);
-  var h = editable ? '<label class="drop">📷 ' + (allowPdf ? 'เพิ่มรูปถ่าย หรือไฟล์ PDF (สเปก/แคตตาล็อก/ใบรับรอง)' : 'เพิ่มรูปถ่ายหน้างาน') + ' – แตะเพื่อเลือก หรือถ่ายจากกล้อง' +
+  var h = editable ? '<label class="drop">' + ic('camera') + (allowPdf ? 'เพิ่มรูปถ่าย หรือไฟล์ PDF (สเปก/แคตตาล็อก/ใบรับรอง)' : 'เพิ่มรูปถ่ายหน้างาน') + ' – แตะเพื่อเลือก หรือถ่ายจากกล้อง' +
     '<input type="file" class="hidden" multiple accept="' + (allowPdf ? 'image/*,application/pdf' : 'image/*') + '" data-up="' + kind + '" data-ref="' + esc(ref) + '" data-pdf="' + (allowPdf ? 1 : 0) + '"></label>' : '';
   if (!list.length) return h + (editable ? '' : '<div class="muted">ไม่มีไฟล์แนบ</div>');
   return h + '<div class="files">' + list.map(function (f) {
     var pdf = f.mime === 'application/pdf';
-    return '<div class="fcard"><div class="fthumb" ' + (pdf ? '' : 'data-fimg="' + f.id + '"') + ' data-open="' + f.id + '" title="' + esc(f.name) + '">' + (pdf ? '📄' : '') + '</div>' +
+    return '<div class="fcard"><div class="fthumb" ' + (pdf ? '' : 'data-fimg="' + f.id + '"') + ' data-open="' + f.id + '" title="' + esc(f.name) + '">' + (pdf ? ic('file') : '') + '</div>' +
       (editable ? '<input class="fcap" data-cap="' + f.id + '" placeholder="คำอธิบาย…" value="' + esc(f.caption) + '">' : '<div class="fcap">' + esc(f.caption || f.name) + '</div>') +
-      (editable ? '<button class="fdel" data-fdel="' + f.id + '" aria-label="ลบไฟล์">🗑 ลบ</button>' : '') + '</div>';
+      (editable ? '<button class="fdel" data-fdel="' + f.id + '" aria-label="ลบไฟล์">' + ic('trash') + '</button>' : '') + '</div>';
   }).join('') + '</div>';
 }
 function openFile(id) {
@@ -309,13 +381,13 @@ function openFile(id) {
 /* ---------------- HOME: รายการโครงการ ---------------- */
 async function vHome() {
   S.projects = (await DB.all('projects')).sort(function (a, b) { return (b.updated || '') < (a.updated || '') ? -1 : 1; });
-  var allTasks = await DB.all('tasks'), lastBk = await meta('lastBackup');
+  var allTasks = await DB.all('tasks'), allEots = await DB.all('eots'), lastBk = await meta('lastBackup');
+  S.projects.forEach(function (p) { p._eots = allEots.filter(function (e) { return e.projectId === p.id; }); });
   var h = '';
   var old = !lastBk || diffDays(today(), D(lastBk.slice(0, 10))) >= 7;
-  if (S.projects.length && old) h += '<div class="banner warn">💾 <span class="grow">' + (lastBk ? 'สำรองข้อมูลครั้งล่าสุด ' + th(lastBk.slice(0, 10), true) : 'ยังไม่เคยสำรองข้อมูล') + ' – ข้อมูลอยู่ในเครื่องนี้เท่านั้น ควรสำรองสัปดาห์ละครั้ง</span><button class="btn sm acc" data-act="backup">สำรองเดี๋ยวนี้</button></div>';
-  h += '<div class="between" style="margin-bottom:12px"><div class="h2" style="margin:0">โครงการทั้งหมด (' + S.projects.filter(function (p) { return !p.archived; }).length + ')</div><div class="row">' +
-    '<button class="btn sec" data-act="importXlsx">📗 นำเข้าจาก Excel v4</button><button class="btn" data-act="newProject">＋ โครงการใหม่</button></div></div>';
-  if (!S.projects.length) return h + '<div class="card empty"><div style="font-size:40px">🏗️</div><p><b>ยังไม่มีโครงการ</b></p><p>เริ่มจากสร้างโครงการใหม่ นำเข้าจากไฟล์ Excel v4 ที่มีอยู่ หรือลองโครงการตัวอย่างเพื่อดูการทำงาน</p>' +
+  if (S.projects.length && old) h += '<div class="banner warn"><span class="grow">' + (lastBk ? 'สำรองข้อมูลครั้งล่าสุด ' + th(lastBk.slice(0, 10), true) : 'ยังไม่เคยสำรองข้อมูล') + ' – ข้อมูลอยู่ในเครื่องนี้เท่านั้น ควรสำรองสัปดาห์ละครั้ง</span><button class="btn sm acc" data-act="backup">สำรองเดี๋ยวนี้</button></div>';
+  h = pageHead('โครงการทั้งหมด', S.projects.filter(function (p) { return !p.archived; }).length + ' โครงการที่กำลังดำเนินการ • ข้อมูลเก็บในเครื่องนี้', '<button class="btn sec" data-act="importXlsx">' + ic('upload') + 'นำเข้าจาก Excel</button><button class="btn" data-act="newProject">' + ic('plus') + 'โครงการใหม่</button>') + h;
+  if (!S.projects.length) return h + '<div class="card empty"><div style="font-size:40px"></div><p><b>ยังไม่มีโครงการ</b></p><p>เริ่มจากสร้างโครงการใหม่ นำเข้าจากไฟล์ Excel v4 ที่มีอยู่ หรือลองโครงการตัวอย่างเพื่อดูการทำงาน</p>' +
     '<div class="row" style="justify-content:center"><button class="btn" data-act="newProject">＋ โครงการใหม่</button><button class="btn sec" data-act="sample">ลองโครงการตัวอย่าง</button></div></div>';
   var act = S.projects.filter(function (p) { return !p.archived; }), arc = S.projects.filter(function (p) { return p.archived; });
   var card = function (p) {
@@ -338,7 +410,7 @@ function projectForm(p) {
     parts: ['งานก่อสร้างอาคาร'], cats: ['งานเตรียมการ', 'งานโครงสร้าง', 'งานสถาปัตยกรรม', 'งานระบบ'] };
   return '<label class="f" for="pName">ชื่อโครงการ</label><input id="pName" class="i" value="' + esc(p.name) + '">' +
     '<label class="f">ลักษณะงาน</label><div class="seg" id="pType">' +
-    '<button type="button" data-t="single" class="' + (p.type !== 'multi' ? 'on' : '') + '">🏢 งานก่อสร้างงานเดียว</button><button type="button" data-t="multi" class="' + (p.type === 'multi' ? 'on' : '') + '">🏘️ โครงการหลายงานส่วน</button></div>' +
+    '<button type="button" data-t="single" class="' + (p.type !== 'multi' ? 'on' : '') + '">งานก่อสร้างงานเดียว</button><button type="button" data-t="multi" class="' + (p.type === 'multi' ? 'on' : '') + '">โครงการหลายงานส่วน</button></div>' +
     '<p class="muted" id="pTypeHelp"></p>' +
     '<div class="grid2">' + PROJ_FIELDS.map(function (f) { return inp('pf_' + f[0], f[1], p[f[0]], f[2], f[3]); }).join('') + '</div>' +
     '<div class="grid2"><div id="pPartsBox"><label class="f" for="pParts">งานส่วน (บรรทัดละ 1 รายการ) เช่น อาคาร รั้ว ถนน</label><textarea id="pParts" class="i" rows="5">' + esc((p.parts || []).join('\n')) + '</textarea></div>' +
@@ -424,7 +496,7 @@ function parseV4(wb) {
 function importXlsx() {
   var parsed = null;
   var bg = modal('<h2>สร้างโครงการจากไฟล์ Excel</h2><p class="muted">รองรับไฟล์แม่แบบ v4 (Plan_vs_Actual หรือ MultiPackage) และไฟล์ที่ส่งออกจากแอปนี้ • อ่านรายการงาน วันแผน วันจริง % ผลงาน และข้อมูลสัญญา</p>' +
-    '<label class="drop">📗 เลือกไฟล์ .xlsx<input type="file" id="xf" class="hidden" accept=".xlsx"></label><div id="xPrev"></div>', async function () {
+    '<label class="drop">เลือกไฟล์ .xlsx<input type="file" id="xf" class="hidden" accept=".xlsx"></label><div id="xPrev"></div>', async function () {
       if (!parsed) throw new Error('เลือกไฟล์ก่อน');
       var s = parsed.settings, multi = parsed.tasks.some(function (t) { return t.part; }) && new Set(parsed.tasks.map(function (t) { return t.part; })).size > 1;
       var p = { id: uid(), created: new Date().toISOString(), updated: new Date().toISOString(), name: val(bg, 'xName') || s.name || 'โครงการจาก Excel', type: multi ? 'multi' : 'single',
@@ -467,7 +539,7 @@ function groupStats(filterFn, d, hist) {
 }
 async function vDash() {
   var d = today(), pid = S.P.id;
-  if (!S.tasks.length) return '<div class="card empty"><div style="font-size:40px">🧱</div><p><b>ยังไม่มีรายการงาน</b></p><p>เพิ่มรายการงานพร้อมวันเริ่ม-เสร็จตามแผน แล้วระบบจะคำนวณแผนงานและ S-Curve ให้</p>' +
+  if (!S.tasks.length) return '<div class="card empty"><div style="font-size:40px"></div><p><b>ยังไม่มีรายการงาน</b></p><p>เพิ่มรายการงานพร้อมวันเริ่ม-เสร็จตามแผน แล้วระบบจะคำนวณแผนงานและ S-Curve ให้</p>' +
     '<button class="btn" data-go="/p/' + pid + '/tasks">ไปที่แท็บผลงาน</button></div>';
   var pl = planAt(d), ac = actualNow(), rv = planAt(d, true), el = diffDays(d, projStart()) + 1, tot = projDur() + num(S.P.eot_days), rem = diffDays(projEnd(), d);
   var spi = pl ? ac / pl : 0, vd = Math.round((ac - pl) * projDur());
@@ -475,14 +547,22 @@ async function vDash() {
   var risk = S.submittals.filter(function (s) { var k = subRisk(s).k; return k === 'bad' || k === 'warn'; }).length;
   var todayRep = S.daily.filter(function (x) { return x.date === iso(d); })[0];
   var h = '';
-  if (!todayRep && d >= projStart() && d <= addDays(projEnd(), 60)) h += '<div class="banner info">📝 <span class="grow">ยังไม่ได้บันทึกรายงานประจำวันของวันนี้</span><button class="btn sm" data-go="/p/' + pid + '/daily/' + iso(d) + '">บันทึกเลย</button></div>';
-  h += '<div class="card"><div class="between"><h2 style="margin:0">ภาพรวม ณ ' + th(d) + '</h2>' + badge(spiState(ac, pl)) + '</div><div class="kpis" style="margin-top:10px">' +
+  if (!todayRep && d >= projStart() && d <= addDays(projEnd(), 60)) h += '<div class="banner info"><span class="grow">ยังไม่ได้บันทึกรายงานประจำวันของวันนี้</span><button class="btn sm" data-go="/p/' + pid + '/daily/' + iso(d) + '">บันทึกเลย</button></div>';
+  var L = ldInfo(), nextI = sortedInst().filter(function (i) { return !i.accepted; })[0];
+  h = pageHead('ภาพรวมโครงการ', 'ข้อมูล ณ วันที่ ' + th(d) + ' • วันที่ ' + Math.max(0, el) + ' ของสัญญา', badge(spiState(ac, pl)) +
+    '<button class="btn sec" data-act="printDash">' + ic('print') + 'พิมพ์</button><button class="btn" data-act="exportV4">' + ic('excel') + 'ส่งออกรายงาน Excel</button>') + h;
+  h += '<div class="card"><h2>ความก้าวหน้าและระยะเวลา</h2><div class="kpis">' +
     kpi('ผลงานตามแผน', pct(pl), (S.tasks.some(function (t) { return t.rs || t.rf; }) ? 'แผนเร่งรัด ' + pct(rv) : '&nbsp;')) +
     kpi('ผลงานจริง', pct(ac), S.tasks.length + ' รายการ', ac >= pl ? 'ok-t' : 'bad-t') +
     kpi('เร็ว/ช้ากว่าแผน', (ac - pl >= 0 ? '+' : '') + pct(ac - pl), 'ประมาณ ' + (vd >= 0 ? '+' : '') + vd + ' วัน', ac >= pl ? 'ok-t' : 'bad-t') +
     kpi('SPI', spi.toFixed(2), spi >= 1 ? 'ตามแผน' : spi >= 0.9 ? 'เฝ้าระวัง' : 'ล่าช้ามาก', spi >= 1 ? 'ok-t' : spi >= 0.9 ? 'warn-t' : 'bad-t') +
     kpi('ระยะเวลา', Math.max(0, el) + ' / ' + tot + ' วัน', rem >= 0 ? 'คงเหลือ ' + rem + ' วัน' : 'เลยกำหนด ' + (-rem) + ' วัน', rem < 0 ? 'bad-t' : '') +
-    kpi('ต้องติดตาม', behind.length + ' รายการ', 'วัสดุเสี่ยงกระทบแผน ' + risk + ' รายการ', behind.length ? 'bad-t' : 'ok-t') + '</div></div>';
+    kpi('ต้องติดตาม', behind.length + ' รายการ', 'วัสดุเสี่ยงกระทบแผน ' + risk + ' รายการ', behind.length ? 'bad-t' : 'ok-t') + '</div></div>' +
+    '<div class="card"><div class="card-h"><h2>สัญญาและการเงิน</h2><button class="btn sm sec" data-go="/p/' + S.P.id + '/fin">รายละเอียด ' + ic('chevr') + '</button></div><div class="kpis">' +
+    kpi('มูลค่าสัญญาปัจจุบัน', money(num(S.P.bac) + voNet()), voNet() ? 'รวมงานเพิ่ม-ลด ' + (voNet() > 0 ? '+' : '') + money(voNet()) : 'ตามสัญญาเดิม') +
+    kpi('สิ้นสุดสัญญา', th(projEnd(), true), eotTotal() ? 'รวมขยายเวลา ' + eotTotal() + ' วัน' : 'ไม่มีการขยายเวลา') +
+    kpi('งวดถัดไป', nextI ? 'งวดที่ ' + esc(nextI.no) : '-', nextI ? 'กำหนด ' + th(nextI.due, true) + ' • ' + instStatus(nextI).t : (S.installments.length ? 'ตรวจรับครบแล้ว' : 'ยังไม่บันทึกงวดงาน'), nextI && instStatus(nextI).k === 'bad' ? 'bad-t' : '') +
+    kpi('ค่าปรับคาดการณ์', L.fLd == null ? '-' : money(L.fLd), L.fDelay ? 'คาดว่าช้ากว่าสัญญา ' + L.fDelay + ' วัน' : 'คาดว่าทันสัญญา', L.fDelay ? 'bad-t' : 'ok-t') + '</div></div>';
   h += '<div class="card"><h2>S-Curve แผนเทียบผลงานจริง</h2><div class="chartbox"><canvas id="curve" aria-label="กราฟ S-Curve"></canvas></div>' +
     '<p class="muted">เส้นผลงานจริงสร้างจากประวัติการอัปเดต % ของแต่ละรายการโดยอัตโนมัติ</p></div>';
   after(function () { drawCurve($('#curve')); });
@@ -532,9 +612,8 @@ function drawCurve(canvas, upTo) {
 var TF = { part: '', st: '', q: '' };
 async function vTasks() {
   var pid = S.P.id, d = today(), w = weightFn();
-  var h = '<div class="card"><div class="between"><h2 style="margin:0">รายการงานและผลงาน</h2><div class="row">' +
-    '<button class="btn sm sec" data-act="pasteTasks">📋 วางจาก Excel</button><button class="btn sm" data-task="">＋ เพิ่มรายการ</button></div></div>' +
-    '<div class="row" style="margin-top:10px"><input class="i grow" id="tq" placeholder="🔍 ค้นหารายการงาน…" value="' + esc(TF.q) + '" style="max-width:340px">' +
+  var h = pageHead('แผนงานและผลงาน', S.tasks.length + ' รายการ • ผลงานรวม ' + pct(actualNow()) + ' • แผน ' + pct(planAt(d)), '<button class="btn sec" data-act="pasteTasks">' + ic('upload') + 'วางจาก Excel</button><button class="btn" data-task="">' + ic('plus') + 'เพิ่มรายการ</button>') +
+    '<div class="card"><div class="row"><input class="i grow" id="tq" placeholder="ค้นหารายการงาน…" value="' + esc(TF.q) + '" style="max-width:340px">' +
     '<div class="chips">' + [['', 'ทั้งหมด'], ['active', 'กำลังทำ'], ['bad', 'ล่าช้า'], ['todo', 'ยังไม่เริ่ม'], ['done', 'เสร็จ']].map(function (x) {
       return '<button class="chip' + (TF.st === x[0] ? ' on' : '') + '" data-tf="' + x[0] + '">' + x[1] + '</button>'; }).join('') + '</div></div>' +
     (isMulti() ? '<div class="chips" style="margin-top:8px">' + [''].concat(parts()).map(function (p) { return '<button class="chip' + (TF.part === p ? ' on' : '') + '" data-tp="' + esc(p) + '">' + esc(p || 'ทุกงานส่วน') + '</button>'; }).join('') + '</div>' : '') +
@@ -556,7 +635,7 @@ async function vTasks() {
       '<div class="between"><div class="m">จริง <b>' + num(t.pct) + '%</b> • ควรได้ ' + (pl * 100).toFixed(0) + '% • แผน ' + th(t.bs, true) + ' – ' + th(t.bf, true) +
       (t.rs || t.rf ? ' • เร่งรัด ' + th(t.rs || t.bs, true) + ' – ' + th(t.rf || t.bf, true) : '') + (t.as ? ' • เริ่มจริง ' + th(t.as, true) : '') + (t.af ? ' • เสร็จจริง ' + th(t.af, true) : '') + '</div>' +
       '<div class="row"><button class="btn sm" data-prog="' + t.id + '">อัปเดต</button><button class="btn sm sec" data-task="' + t.id + '" aria-label="แก้ไขรายการ">แก้ไข</button></div></div>' +
-      (t.remark ? '<div class="m">📝 ' + esc(t.remark) + '</div>' : '') + '</div>';
+      (t.remark ? '<div class="m">' + esc(t.remark) + '</div>' : '') + '</div>';
   };
   if (isMulti() && !TF.part) {
     parts().forEach(function (p) { var L = list.filter(function (o) { return o.t.part === p; }); if (!L.length) return;
@@ -670,16 +749,17 @@ function pasteTasks() {
 async function vProjSet() {
   var p = S.P;
   after(function () { var box = $('#projFormBox'); if (box) wireProjectForm(box); });
-  return '<div class="card" id="projFormBox"><h2>ข้อมูลโครงการ</h2>' + projectForm(p) +
+  return pageHead('ตั้งค่าโครงการ', 'ข้อมูลสัญญา ผู้เกี่ยวข้อง งานส่วน และหมวดงาน', '') + '<div class="card" id="projFormBox"><h2>ข้อมูลโครงการ</h2>' + projectForm(p) +
     '<div class="row" style="margin-top:14px"><button class="btn" data-act="saveProj">บันทึก</button></div></div>' +
-    '<div class="card"><h2>ข้อมูลและไฟล์</h2><div class="row"><button class="btn sec" data-act="exportXlsx">📥 ส่งออก Excel (โครงการนี้)</button><button class="btn sec" data-act="backup">💾 สำรองข้อมูลทั้งหมด</button></div>' +
-    '<p class="muted">ส่งออก Excel ใช้เปิดดู/ส่งต่อ และนำเข้าเป็นโครงการใหม่ได้ • การสำรองข้อมูลเก็บทุกโครงการรวมรูปภาพเป็นไฟล์เดียว</p></div>' +
-    '<div class="card"><h2>จัดการโครงการ</h2><div class="row"><button class="btn sec" data-act="archive">' + (p.archived ? '📤 นำออกจากคลัง' : '🗄️ เก็บเข้าคลัง (โครงการจบแล้ว)') + '</button>' +
+    '<div class="card"><h2>ส่งออกและสำรองข้อมูล</h2><div class="row"><button class="btn" data-act="exportV4">' + ic('excel') + 'รายงาน Excel (รูปแบบ v4)</button><button class="btn sec" data-act="exportXlsx">' + ic('download') + 'ข้อมูลดิบ Excel</button><button class="btn sec" data-act="backup">' + ic('backup') + 'สำรองข้อมูลทั้งหมด</button></div>' +
+    '<p class="muted"><b>รายงาน Excel (รูปแบบ v4)</b> – ไฟล์ควบคุมงานฉบับเต็ม 13–14 ชีต (Dashboard, รายงาน, Gantt, S-Curve, งวดงาน, เงินงวด, VO, ขยายเวลา, วัสดุ ฯลฯ) พร้อมสูตรและกราฟ คำนวณใหม่เมื่อเปิดใน Excel • <b>ข้อมูลดิบ</b> – ตารางข้อมูลสำหรับวิเคราะห์ต่อ • ทั้งสองแบบนำเข้ากลับเป็นโครงการใหม่ได้</p></div>' +
+    '<div class="card"><h2>จัดการโครงการ</h2><div class="row"><button class="btn sec" data-act="archive">' + (p.archived ? 'นำออกจากคลัง' : 'เก็บเข้าคลัง (โครงการจบแล้ว)') + '</button>' +
     '<button class="btn bad" data-act="delProject">ลบโครงการ</button></div><p class="muted">ลบโครงการจะลบรายการงาน ประวัติผลงาน รายงาน รูปภาพ และรายการวัสดุของโครงการนี้ทั้งหมด (กู้คืนได้จากไฟล์สำรองเท่านั้น)</p></div>';
 }
 
 /* ---------------- DAILY REPORT ---------------- */
-var WEATHER = ['☀️ แจ่มใส', '⛅ มีเมฆ', '🌦️ ฝนเล็กน้อย', '🌧️ ฝนตกหนัก'];
+var WEATHER = ['แจ่มใส', 'มีเมฆ', 'ฝนเล็กน้อย', 'ฝนตกหนัก'];
+function wx(v) { return String(v || '').replace(/^[^\u0E00-\u0E7F]+/, ''); }
 var WORK_ST = ['ทำงานได้ตามปกติ', 'ทำงานได้บางส่วน', 'หยุดงาน (ฝนตก)', 'หยุดงาน (วันหยุด/อื่นๆ)'];
 var TRADES = ['โฟร์แมน', 'ช่างไม้', 'ช่างเหล็ก', 'ช่างปูน', 'ช่างไฟฟ้า', 'ช่างประปา', 'ช่างเชื่อม', 'ช่างทาสี', 'กรรมกร'];
 function dailyOf(dIso) { return S.daily.filter(function (x) { return x.date === dIso; })[0]; }
@@ -689,8 +769,7 @@ async function vDaily(args) {
   var pid = S.P.id;
   if (args[0]) return dailyEditor(args[0]);
   var list = S.daily.slice().sort(function (a, b) { return a.date < b.date ? 1 : -1; });
-  var h = '<div class="card"><div class="between"><h2 style="margin:0">รายงานประจำวัน</h2><div class="row"><input type="date" class="i" id="dPick" value="' + iso(today()) + '" style="width:170px" aria-label="เลือกวันที่">' +
-    '<button class="btn" data-act="openDay">เปิด / สร้าง</button></div></div><p class="muted">บันทึกสภาพอากาศ คนงาน เครื่องจักร งานที่ทำ ผลงานรายรายการ และรูปถ่าย – บันทึกอัตโนมัติขณะพิมพ์ • รายงานรายสัปดาห์จะรวบรวมจากรายงานประจำวันให้เอง</p></div>';
+  var h = pageHead('รายงานประจำวัน', 'บันทึกการปฏิบัติงานประจำวันของผู้ควบคุมงาน • บันทึกอัตโนมัติขณะพิมพ์', '<input type="date" class="i" id="dPick" value="' + iso(today()) + '" style="width:170px" aria-label="เลือกวันที่"><button class="btn" data-act="openDay">' + ic('plus') + 'เปิด / สร้างรายงาน</button>');
   if (!list.length) return h + '<div class="card empty">ยังไม่มีรายงานประจำวัน – เลือกวันที่แล้วกด "เปิด / สร้าง"</div>';
   var month = '';
   list.forEach(function (r) {
@@ -698,7 +777,7 @@ async function vDaily(args) {
     if (m !== month) { h += '<div class="h3">' + m + '</div>'; month = m; }
     var ph = filesOf('daily', r.date).length, pc = S.progress.filter(function (x) { return x.date === r.date && x.source === 'daily'; }).length;
     h += '<div class="item pcard" data-go="/p/' + pid + '/daily/' + r.date + '" tabindex="0"><div class="between"><div><span class="t">' + TDAY[d.getDay()] + ' ' + th(r.date) + '</span>' +
-      '<div class="m">' + esc((r.weatherAM || '').split(' ')[0] + ' ' + (r.weatherPM || '').split(' ')[0]) + ' ' + esc(r.status || '') + ' • คนงาน ' + manTotal(r) + ' คน' + (pc ? ' • อัปเดตผลงาน ' + pc + ' รายการ' : '') + (ph ? ' • 📷 ' + ph : '') + '</div></div>' +
+      '<div class="m">' + esc((r.weatherAM || '').split(' ')[0] + ' ' + (r.weatherPM || '').split(' ')[0]) + ' ' + esc(r.status || '') + ' • คนงาน ' + manTotal(r) + ' คน' + (pc ? ' • อัปเดตผลงาน ' + pc + ' รายการ' : '') + (ph ? ' • ' + ph : '') + '</div></div>' +
       '<span class="muted">›</span></div>' + (r.work ? '<div class="m" style="margin-top:4px">' + esc(r.work.slice(0, 140)) + (r.work.length > 140 ? '…' : '') + '</div>' : '') + '</div>';
   });
   return h;
@@ -718,7 +797,7 @@ function activeTasksOn(dIso) {
 async function dailyEditor(dIso) {
   if (!D(dIso)) throw new Error('วันที่ไม่ถูกต้อง');
   var r = dailyOf(dIso), pid = S.P.id, d = D(dIso), hist = histIndex();
-  var draft = r || { id: pid + '_' + dIso, projectId: pid, date: dIso, weatherAM: WEATHER[0], weatherPM: WEATHER[0], status: WORK_ST[0], manpower: [], machinery: [] };
+  var draft = r ? Object.assign({}, r, { weatherAM: wx(r.weatherAM), weatherPM: wx(r.weatherPM) }) : { id: pid + '_' + dIso, projectId: pid, date: dIso, weatherAM: WEATHER[0], weatherPM: WEATHER[0], status: WORK_ST[0], manpower: [], machinery: [] };
   S.dailyDraft = JSON.parse(JSON.stringify(draft)); S.dailySaved = !!r;
   var prev = S.daily.filter(function (x) { return x.date < dIso; }).sort(function (a, b) { return a.date < b.date ? 1 : -1; })[0];
   var act = activeTasksOn(dIso);
@@ -729,7 +808,7 @@ async function dailyEditor(dIso) {
     '<div><div class="h2" style="margin:0">' + TDAY[d.getDay()] + ' ' + th(dIso) + '</div><div class="muted">สัปดาห์ที่ ' + weekOf(d) + ' • วันที่ ' + (diffDays(d, projStart()) + 1) + ' ของสัญญา</div></div>' +
     '<button class="btn sm sec" data-go="/p/' + pid + '/daily/' + iso(addDays(d, 1)) + '" aria-label="วันถัดไป">›</button></div>' +
     '<div class="row"><span id="saveState" class="muted">' + (r ? '✓ บันทึกแล้ว' : 'ยังไม่บันทึก') + '</span><button class="btn sm sec" data-go="/p/' + pid + '/daily">รายการ</button>' +
-    '<button class="btn sm sec" data-act="printDaily" data-date="' + dIso + '">🖨️ พิมพ์</button>' + (r ? '<button class="btn sm ghost bad-t" data-act="delDaily" data-date="' + dIso + '">ลบ</button>' : '') + '</div></div></div>';
+    '<button class="btn sm sec" data-act="printDaily" data-date="' + dIso + '">พิมพ์</button>' + (r ? '<button class="btn sm ghost bad-t" data-act="delDaily" data-date="' + dIso + '">ลบ</button>' : '') + '</div></div></div>';
   h += '<div class="card"><h2>สภาพอากาศและการทำงาน</h2><div class="grid3"><div><label class="f" for="weatherAM">ช่วงเช้า</label>' + sel('weatherAM', WEATHER, draft.weatherAM) + '</div>' +
     '<div><label class="f" for="weatherPM">ช่วงบ่าย</label>' + sel('weatherPM', WEATHER, draft.weatherPM) + '</div><div><label class="f" for="status">สถานะการทำงาน</label>' + sel('status', WORK_ST, draft.status) + '</div></div></div>';
   h += '<div class="card"><div class="between"><h2 style="margin:0">คนงาน <span class="muted" id="manSum">รวม ' + manTotal(draft) + ' คน</span></h2>' +
@@ -796,7 +875,7 @@ async function vWeekly(args) {
   var pid = S.P.id;
   if (args[0]) return weeklyEditor(+args[0]);
   var cur = weekOf(today()), last = Math.min(Math.max(cur, 1), totalWeeks() + 8);
-  var h = '<div class="card"><h2>รายงานรายสัปดาห์</h2><p class="muted">รวบรวมจากรายงานประจำวันและประวัติผลงานให้อัตโนมัติ – เพิ่มสรุป แผนสัปดาห์หน้า และความเห็น แล้วพิมพ์เป็นบันทึกข้อความเสนอคณะกรรมการตรวจรับ</p></div>';
+  var h = pageHead('รายงานรายสัปดาห์', 'รวบรวมจากรายงานประจำวันและประวัติผลงาน • พิมพ์เป็นบันทึกข้อความเสนอคณะกรรมการตรวจรับพัสดุ', '');
   for (var n = last; n >= 1; n--) {
     var r = weekRange(n), a = iso(r.start), b = iso(r.end), nd = S.daily.filter(function (x) { return x.date >= a && x.date <= b; }).length, w = weekRec(n);
     h += '<div class="item pcard" data-go="/p/' + pid + '/weekly/' + n + '" tabindex="0"><div class="between"><div><span class="t">สัปดาห์ที่ ' + n + '</span> <span class="muted">' + th(r.start, true) + ' – ' + th(r.end, true) + '</span>' +
@@ -817,7 +896,7 @@ async function weeklyEditor(n) {
     '<div><div class="h2" style="margin:0">สัปดาห์ที่ ' + n + '</div><div class="muted">' + th(st.r.start) + ' – ' + th(st.r.end) + (st.partial ? ' (ยังไม่ครบสัปดาห์)' : '') + '</div></div>' +
     '<button class="btn sm sec" data-go="/p/' + pid + '/weekly/' + (n + 1) + '" aria-label="สัปดาห์ถัดไป">›</button></div>' +
     '<div class="row"><span id="saveState" class="muted">' + (weekRec(n) ? '✓ บันทึกแล้ว' : 'ยังไม่บันทึก') + '</span><button class="btn sm sec" data-go="/p/' + pid + '/weekly">รายการ</button>' +
-    '<button class="btn sm" data-act="printWeekly" data-week="' + n + '">🖨️ พิมพ์บันทึกข้อความ</button></div></div></div>';
+    '<button class="btn sm" data-act="printWeekly" data-week="' + n + '">พิมพ์บันทึกข้อความ</button></div></div></div>';
   h += '<div class="card"><h2>สรุปอัตโนมัติ</h2><div class="kpis">' +
     kpi('ผลงานตามแผนสะสม', pct(st.plan), 'ณ สิ้นสัปดาห์') + kpi('ผลงานจริงสะสม', pct(st.act), 'สัปดาห์นี้ +' + pct(st.act - st.actPrev), st.act >= st.plan ? 'ok-t' : 'bad-t') +
     kpi('เร็ว/ช้ากว่าแผน', (st.act - st.plan >= 0 ? '+' : '') + pct(st.act - st.plan), Math.round((st.act - st.plan) * projDur()) + ' วัน', st.act >= st.plan ? 'ok-t' : 'bad-t') +
@@ -848,18 +927,20 @@ async function saveWeekly() {
 /* ---------------- PRINT DOCUMENTS ---------------- */
 async function vPrint(args) {
   var kind = args[0], key = args[1], back = kind === 'daily' ? '/daily/' + key : kind === 'weekly' ? '/weekly/' + key : '/mat/' + key;
-  var bar = '<div class="card noprint"><div class="row"><button class="btn sm sec" data-go="/p/' + S.P.id + back + '">← กลับ</button><button class="btn" data-act="print">🖨️ พิมพ์ / บันทึกเป็น PDF</button>' +
+  var bar = '<div class="card noprint"><div class="row"><button class="btn sm sec" data-go="/p/' + S.P.id + back + '">← กลับ</button><button class="btn" data-act="print">พิมพ์ / บันทึกเป็น PDF</button>' +
     '<span class="muted">เลือกเครื่องพิมพ์ "บันทึกเป็น PDF" เพื่อได้ไฟล์ส่งต่อ</span></div></div>';
   if (kind === 'daily') return bar + docDaily(key);
   if (kind === 'weekly') { after(function () { drawCurve($('#wcurve'), weekRange(+key).end > today() ? today() : weekRange(+key).end); }); return bar + docWeekly(+key); }
   if (kind === 'mat') return bar + docMat(key);
+  if (kind === 'pay') return bar + docPay(key);
+  if (kind === 'dash') return bar + docDash();
   return bar;
 }
 function docHead(title) {
   var p = S.P;
   return '<table style="margin-bottom:10px"><tr><td style="width:24%">โครงการ</td><td colspan="3"><b>' + esc(p.name) + '</b></td></tr>' +
     '<tr><td>ผู้รับจ้าง</td><td>' + esc(p.contractor || '-') + '</td><td style="width:18%">เลขที่สัญญา</td><td>' + esc(p.contract_no || '-') + '</td></tr>' +
-    '<tr><td>ระยะเวลาสัญญา</td><td>' + th(projStart(), true) + ' – ' + th(projEnd(), true) + ' (' + (projDur() + num(p.eot_days)) + ' วัน)</td><td>ผู้ว่าจ้าง</td><td>' + esc(p.employer || '-') + '</td></tr></table>';
+    '<tr><td>ระยะเวลาสัญญา</td><td>' + th(projStart(), true) + ' – ' + th(projEnd(), true) + ' (' + (projDur() + eotTotal()) + ' วัน)</td><td>ผู้ว่าจ้าง</td><td>' + esc(p.employer || '-') + '</td></tr></table>';
 }
 function photoGrid(list, label) {
   if (!list.length) return '';
@@ -870,7 +951,7 @@ function docDaily(dIso) {
   var moved = wbsList().map(function (o) { return { o: o, from: taskPctAt(hist, o.t.id, prev), to: taskPctAt(hist, o.t.id, dIso) }; }).filter(function (x) { return x.to !== x.from; });
   var box = function (lab, v) { return '<h3>' + lab + '</h3><div class="box">' + esc(v || '-') + '</div>'; };
   return '<div class="doc"><h1>บันทึกการปฏิบัติงานประจำวันของผู้ควบคุมงาน</h1><p style="text-align:center;margin-top:-4px">' + esc(p.org || '') + '</p>' + docHead() +
-    '<table><tr><td style="width:24%">วันที่</td><td><b>' + TDAY[d.getDay()] + ' ' + th(dIso) + '</b></td><td style="width:18%">วันที่ของสัญญา</td><td>' + (diffDays(d, projStart()) + 1) + ' / ' + (projDur() + num(p.eot_days)) + '</td></tr>' +
+    '<table><tr><td style="width:24%">วันที่</td><td><b>' + TDAY[d.getDay()] + ' ' + th(dIso) + '</b></td><td style="width:18%">วันที่ของสัญญา</td><td>' + (diffDays(d, projStart()) + 1) + ' / ' + (projDur() + eotTotal()) + '</td></tr>' +
     '<tr><td>สภาพอากาศ</td><td>เช้า ' + esc(r.weatherAM || '-') + ' • บ่าย ' + esc(r.weatherPM || '-') + '</td><td>การทำงาน</td><td>' + esc(r.status || '-') + '</td></tr></table>' +
     '<h3>คนงานและเครื่องจักร</h3><div class="pgrid" style="gap:10px"><table><tr><th>ประเภทช่าง</th><th class="num">จำนวน (คน)</th></tr>' + ((r.manpower || []).map(function (x) { return '<tr><td>' + esc(x.trade) + '</td><td class="num">' + num(x.count) + '</td></tr>'; }).join('') || '<tr><td colspan="2">-</td></tr>') +
     '<tr><th>รวม</th><th class="num">' + manTotal(r) + '</th></tr></table><table><tr><th>เครื่องจักร / เครื่องมือ</th><th class="num">จำนวน</th></tr>' + ((r.machinery || []).map(function (x) { return '<tr><td>' + esc(x.name) + '</td><td class="num">' + num(x.count) + '</td></tr>'; }).join('') || '<tr><td colspan="2">-</td></tr>') + '</table></div>' +
@@ -893,7 +974,7 @@ function docWeekly(n) {
     '<b>เรื่อง</b><div>รายงานผลการปฏิบัติงานของผู้รับจ้าง ประจำสัปดาห์ที่ ' + n + ' (' + th(r.start, true) + ' – ' + th(r.end, true) + ')</div><b>เรียน</b><div>ประธานกรรมการตรวจรับพัสดุ</div></div>' +
     '<p class="para">ตามที่ ' + esc(p.employer || '(ผู้ว่าจ้าง)') + ' ได้ทำสัญญาจ้าง ' + esc(p.contractor || '(ผู้รับจ้าง)') + ' ดำเนินการ' + esc(p.name) + ' ตามสัญญาเลขที่ ' + esc(p.contract_no || '……') +
     ' ลงวันที่ ' + (p.contract_date ? th(p.contract_date) : '……') + (num(p.bac) ? ' วงเงิน ' + money(p.bac) + ' บาท' : '') + ' ระยะเวลา ' + projDur() + ' วัน เริ่มสัญญาวันที่ ' + th(projStart()) + ' สิ้นสุดสัญญาวันที่ ' + th(projEnd()) +
-    (num(p.eot_days) ? ' (รวมขยายเวลา ' + num(p.eot_days) + ' วัน)' : '') + ' นั้น</p><p class="para">ข้าพเจ้าในฐานะผู้ควบคุมงาน ขอรายงานผลการปฏิบัติงานของผู้รับจ้าง ประจำสัปดาห์ที่ ' + n + ' ดังนี้</p>' +
+    (eotTotal() ? ' (รวมขยายเวลา ' + eotTotal() + ' วัน)' : '') + (voNet() ? ' มูลค่าสัญญาปัจจุบันรวมงานเพิ่ม-ลด ' + money(num(p.bac) + voNet()) + ' บาท' : '') + ' นั้น</p><p class="para">ข้าพเจ้าในฐานะผู้ควบคุมงาน ขอรายงานผลการปฏิบัติงานของผู้รับจ้าง ประจำสัปดาห์ที่ ' + n + ' ดังนี้</p>' +
     '<h3>1. ความก้าวหน้าของงาน</h3><table><tr><td>ผลงานตามแผนสะสม</td><td class="num">' + pct(st.plan) + '</td><td>ผลงานจริงสะสม</td><td class="num"><b>' + pct(st.act) + '</b></td></tr>' +
     '<tr><td>เร็ว (+) / ช้า (−) กว่าแผน</td><td class="num">' + (st.act - st.plan >= 0 ? '+' : '') + pct(st.act - st.plan) + ' (' + Math.round((st.act - st.plan) * projDur()) + ' วัน)</td><td>ผลงานสัปดาห์นี้</td><td class="num">' + pct(st.act - st.actPrev) + '</td></tr>' +
     '<tr><td>ระยะเวลาดำเนินการแล้ว</td><td class="num">' + el + ' วัน (' + pct(el / tot, 1) + ')</td><td>ระยะเวลาคงเหลือ</td><td class="num">' + (remD >= 0 ? remD + ' วัน' : 'เลยกำหนด ' + (-remD) + ' วัน') + '</td></tr>' +
@@ -907,12 +988,31 @@ function docWeekly(n) {
     '<h3>4. แผนงานสัปดาห์หน้า</h3>' + box(w.next_plan) +
     (nxt.length ? '<table style="margin-top:6px"><tr><th>งานที่กำลังดำเนินการ / ต้องเริ่มใน 14 วัน</th><th class="num">% ผลงาน</th><th>กำหนดเสร็จ</th></tr>' + nxt.map(function (o) { return '<tr><td>' + esc(o.wbs + ' ' + o.t.desc) + '</td><td class="num">' + num(o.t.pct) + '%</td><td>' + th(o.t.rf || o.t.bf, true) + '</td></tr>'; }).join('') + '</table>' : '') +
     '<h3>5. วัสดุเข้าหน่วยงาน / การทดสอบ</h3>' + box(w.materials != null ? w.materials : compileText(st, 'materials')) +
-    (subs.length ? '<h3>6. การขออนุมัติวัสดุที่ต้องติดตาม</h3><table><tr><th>เลขที่</th><th>วัสดุ</th><th>ผลพิจารณา</th><th>สถานะ</th></tr>' + subs.map(function (s) { return '<tr><td>' + esc(s.doc_no) + '</td><td>' + esc(s.material) + '</td><td>' + esc(s.status) + '</td><td>' + esc(subRisk(s).t) + '</td></tr>'; }).join('') + '</table>' : '') +
-    '<h3>' + (subs.length ? 7 : 6) + '. ปัญหา อุปสรรค</h3>' + box(w.issues != null ? w.issues : compileText(st, 'issues')) + '<h3>' + (subs.length ? 8 : 7) + '. ความเห็นของผู้ควบคุมงาน</h3>' + box(w.opinion) +
+    '<h3>6. งวดงานและการขยายเวลา</h3>' + weeklyFinSection() +
+    (subs.length ? '<h3>7. การขออนุมัติวัสดุที่ต้องติดตาม</h3><table><tr><th>เลขที่</th><th>วัสดุ</th><th>ผลพิจารณา</th><th>สถานะ</th></tr>' + subs.map(function (s) { return '<tr><td>' + esc(s.doc_no) + '</td><td>' + esc(s.material) + '</td><td>' + esc(s.status) + '</td><td>' + esc(subRisk(s).t) + '</td></tr>'; }).join('') + '</table>' : '') +
+    '<h3>' + (subs.length ? 8 : 7) + '. ปัญหา อุปสรรค</h3>' + box(w.issues != null ? w.issues : compileText(st, 'issues')) + '<h3>' + (subs.length ? 9 : 8) + '. ความเห็นของผู้ควบคุมงาน</h3>' + box(w.opinion) +
     '<p class="para" style="margin-top:14px">จึงเรียนมาเพื่อโปรดทราบ</p><div class="sig1">ลงชื่อ ..........................................<br>(' + esc(p.supervisor_name || '..........................................') + ')<br>' + esc(p.supervisor_pos || 'ผู้ควบคุมงาน') + '</div>' +
     '<h3>ความเห็นของคณะกรรมการตรวจรับพัสดุ</h3><div class="box" style="min-height:60px">☐ รับทราบ &nbsp; ☐ ให้ผู้รับจ้างเร่งรัดงาน &nbsp; ☐ อื่นๆ ........................................................</div>' +
     '<div class="sig">' + [[p.chair, 'ประธานกรรมการ'], [p.member1, 'กรรมการ'], [p.member2, 'กรรมการ']].map(function (x) { return '<div>ลงชื่อ ...........................<br>(' + esc(x[0] || '...........................') + ')<br>' + x[1] + '</div>'; }).join('') + '</div>' +
     (photos.length ? '<div class="pb"></div><h3>ภาคผนวก: ภาพถ่ายประกอบรายงาน ประจำสัปดาห์ที่ ' + n + '</h3>' + photoGrid(photos, 'รูปที่') : '') + '</div>';
+}
+
+function weeklyFinSection() {
+  var L = ldInfo(), list = sortedInst(), pend = S.eots.filter(function (e) { return e.status === 'รอพิจารณา'; }).reduce(function (a, e) { return a + num(e.days_claimed); }, 0);
+  return (list.length ? '<table><tr><th>งวด</th><th>เนื้องาน</th><th>กำหนดเสร็จ</th><th class="num">จำนวนเงิน</th><th>สถานะ</th></tr>' + list.map(function (i) {
+    return '<tr><td>' + esc(i.no) + '</td><td>' + esc(i.scope) + '</td><td>' + th(i.due, true) + '</td><td class="num">' + money(num(i.amount) + num(i.vo_amount)) + '</td><td>' + esc(instStatus(i).t) + '</td></tr>'; }).join('') + '</table>' : '<p>ยังไม่ได้บันทึกงวดงาน</p>') +
+    '<p>ขยายเวลาที่อนุมัติแล้ว ' + eotTotal() + ' วัน • รอพิจารณา ' + pend + ' วัน • ค่าปรับวันละ ' + money(L.per) + ' บาท' + (L.late ? ' • <b>เลยกำหนดสัญญาแล้ว ' + L.late + ' วัน ค่าปรับ ' + money(L.incurred) + ' บาท</b>' : '') + '</p>';
+}
+function docDash() {
+  var p = S.P, d = today(), pl = planAt(d), ac = actualNow(), L = ldInfo();
+  var rows = [['ผลงานตามแผนสะสม', pct(pl)], ['ผลงานจริงสะสม', pct(ac)], ['เร็ว (+) / ช้า (−) กว่าแผน', (ac - pl >= 0 ? '+' : '') + pct(ac - pl) + ' (' + Math.round((ac - pl) * projDur()) + ' วัน)'], ['SPI', (pl ? ac / pl : 0).toFixed(2)],
+    ['มูลค่าสัญญาปัจจุบัน', money(num(p.bac) + voNet()) + ' บาท'], ['วันสิ้นสุดสัญญา (รวมขยายเวลา ' + eotTotal() + ' วัน)', th(projEnd())], ['ค่าปรับคาดการณ์', L.fLd == null ? '-' : money(L.fLd) + ' บาท']];
+  var pk = isMulti() ? '<h3>ความก้าวหน้ารายงานส่วน</h3><table><tr><th>งานส่วน</th><th class="num">น้ำหนัก</th><th class="num">แผน</th><th class="num">จริง</th><th>สถานะ</th></tr>' + parts().map(function (x) { var g = groupStats(function (t) { return t.part === x; }, d); return g ? '<tr><td>' + esc(x) + '</td><td class="num">' + pct(g.W, 1) + '</td><td class="num">' + pct(g.pl, 1) + '</td><td class="num">' + pct(g.ac, 1) + '</td><td>' + esc(g.st.t) + '</td></tr>' : ''; }).join('') + '</table>' : '';
+  after(function () { drawCurve($('#dcurve')); });
+  return '<div class="doc"><h1>สรุปสถานะโครงการ</h1><p style="text-align:center;margin-top:-4px">ข้อมูล ณ วันที่ ' + th(d) + '</p>' + docHead() +
+    '<h3>ตัวชี้วัดหลัก</h3><table>' + rows.map(function (r) { return '<tr><td style="width:45%">' + r[0] + '</td><td>' + r[1] + '</td></tr>'; }).join('') + '</table>' +
+    '<div class="chartbox" style="height:250px;margin-top:10px"><canvas id="dcurve"></canvas></div>' + pk +
+    '<div class="sig1">ลงชื่อ ..........................................<br>(' + esc(p.supervisor_name || '..........................................') + ')<br>' + esc(p.supervisor_pos || 'ผู้ควบคุมงาน') + '</div></div>';
 }
 
 /* ---------------- MATERIAL SUBMITTALS ---------------- */
@@ -947,17 +1047,17 @@ async function vMat(args) {
   if (args[0]) return matDetail(args[0]);
   var list = S.submittals.slice().sort(function (a, b) { return (a.doc_no || '').localeCompare(b.doc_no || '', 'th'); }), pid = S.P.id;
   var cnt = function (f) { return list.filter(f).length; };
-  var h = '<div class="card"><div class="between"><h2 style="margin:0">ขออนุมัติใช้วัสดุ</h2><button class="btn" data-sub="new">＋ ยื่นขออนุมัติ</button></div>' +
-    '<div class="kpis" style="margin-top:10px">' + kpi('ทั้งหมด', list.length) + kpi('อนุมัติแล้ว', cnt(function (s) { return s.status === 'อนุมัติ'; }), '', 'ok-t') +
+  var h = pageHead('ขออนุมัติใช้วัสดุ', 'ทะเบียนการเสนอขออนุมัติ ตรวจเทียบ' + esc((window.SPEC && SPEC.source) || 'รายการประกอบแบบ') + ' และติดตามกำหนดอนุมัติ', '<button class="btn" data-sub="new">' + ic('plus') + 'ยื่นขออนุมัติ</button>') +
+    '<div class="card"><div class="kpis">' + kpi('ทั้งหมด', list.length) + kpi('อนุมัติแล้ว', cnt(function (s) { return s.status === 'อนุมัติ'; }), '', 'ok-t') +
     kpi('รอพิจารณา / ขอเอกสาร', cnt(function (s) { return s.status === 'รอพิจารณา' || s.status === 'ขอเอกสารเพิ่มเติม'; }), '', 'warn-t') +
     kpi('เสี่ยงกระทบแผนงาน', cnt(function (s) { var k = subRisk(s).k; return k === 'bad' || k === 'warn'; }), '', 'bad-t') + '</div>' +
-    '<p class="muted">ต้องอนุมัติภายใน = วันเริ่มของรายการงานที่ใช้วัสดุ − ระยะเวลาสั่งผลิต/จัดส่ง • ตรวจสเปกทีละข้อเทียบ' + esc((window.SPEC && SPEC.source) || 'รายการประกอบแบบ') + '</p></div>';
+    '<p class="muted" style="margin-top:10px">ต้องอนุมัติภายใน = วันเริ่มของรายการงานที่ใช้วัสดุ − ระยะเวลาสั่งผลิต/จัดส่ง</p></div>';
   if (!list.length) return h + '<div class="card empty">ยังไม่มีรายการขออนุมัติวัสดุ</div>';
   return h + list.map(function (s) { var r = subRisk(s), t = taskById(s.taskId), cs = checkSummary(s);
     return '<div class="item pcard" data-go="/p/' + pid + '/mat/' + s.id + '" tabindex="0"><div class="between"><div class="grow"><span class="muted">' + esc(s.doc_no) + '</span> <span class="t">' + esc(s.material) + '</span>' +
       '<div class="m">' + esc(s.brand || '') + (s.spec_sec ? ' • ' + esc(specName(s.spec_sec)) : '') + (t ? ' • ใช้กับ ' + esc(wbsOf(t.id) + ' ' + t.desc) : '') + '</div></div>' +
       '<div style="text-align:right">' + badge({ k: s.status === 'อนุมัติ' ? 'ok' : s.status === 'ไม่อนุมัติ' ? 'bad' : 'warn', t: s.status }) + '</div></div>' +
-      '<div class="m" style="margin-top:4px">' + badge(r) + (r.need ? ' ต้องอนุมัติภายใน ' + th(r.need, true) : '') + ' • ตรวจแล้ว ' + cs.done + '/' + cs.n + ' ข้อ • 📎 ' + filesOf('submittal', s.id).length + '</div></div>'; }).join('');
+      '<div class="m" style="margin-top:4px">' + badge(r) + (r.need ? ' ต้องอนุมัติภายใน ' + th(r.need, true) : '') + ' • ตรวจแล้ว ' + cs.done + '/' + cs.n + ' ข้อ • ' + filesOf('submittal', s.id).length + '</div></div>'; }).join('');
 }
 function openSub(id) {
   var s = id ? S.submittals.filter(function (x) { return x.id === id; })[0] : { status: 'รอพิจารณา', submitted_date: iso(today()), lead_days: 14 };
@@ -988,16 +1088,16 @@ function openSub(id) {
   };
 }
 async function matDetail(sid) {
+  S._aiCfg = await aiCfg();
   var s = S.submittals.filter(function (x) { return x.id === sid; })[0], pid = S.P.id;
   if (!s) return '<div class="card empty">ไม่พบรายการ <button class="btn sm sec" data-go="/p/' + pid + '/mat">กลับ</button></div>';
   var r = subRisk(s), t = taskById(s.taskId), cr = criteriaOf(s), cs = checkSummary(s), ch = s.checks || {};
-  var h = '<div class="card"><div class="between"><button class="btn sm sec" data-go="/p/' + pid + '/mat">← ทะเบียน</button><div class="row"><button class="btn sm sec" data-go="/p/' + pid + '/print/mat/' + sid + '">🖨️ รายงานขออนุมัติ</button>' +
-    '<button class="btn sm" data-sub="' + sid + '">แก้ไข</button></div></div><h2 style="margin:10px 0 0">' + esc(s.doc_no) + ' • ' + esc(s.material) + '</h2>' +
-    '<div class="muted">' + esc(s.brand || '') + (s.spec_sec ? ' • ' + esc(specName(s.spec_sec)) : '') + '</div>' +
-    '<div class="kpis" style="margin-top:10px">' + kpi('ใช้กับงาน', t ? esc(wbsOf(t.id)) : '-', t ? esc(t.desc) : '') +
+  var h = pageHead(esc(s.doc_no) + ' • ' + esc(s.material), esc(s.brand || '') + (s.spec_sec ? ' • ' + esc(specName(s.spec_sec)) : ''),
+    '<button class="btn sec" data-go="/p/' + pid + '/mat">' + ic('chevl') + 'ทะเบียน</button><button class="btn sec" data-go="/p/' + pid + '/print/mat/' + sid + '">' + ic('print') + 'รายงานขออนุมัติ</button><button class="btn" data-sub="' + sid + '">' + ic('edit') + 'แก้ไข</button>') +
+    '<div class="card"><div class="kpis">' + kpi('ใช้กับงาน', t ? esc(wbsOf(t.id)) : '-', t ? esc(t.desc) : '') +
     kpi('ต้องอนุมัติภายใน', r.need ? th(r.need, true) : '-', badge(r)) + kpi('ผลการตรวจ', cs.done + ' / ' + cs.n + ' ข้อ', 'ผ่าน ' + cs.c['ผ่าน'] + ' • ไม่ผ่าน ' + cs.c['ไม่ผ่าน'] + ' • ไม่พบ ' + cs.c['ไม่พบข้อมูล']) +
     kpi('ผลพิจารณา', esc(s.status), s.approved_date ? 'เมื่อ ' + th(s.approved_date, true) : '', s.status === 'อนุมัติ' ? 'ok-t' : s.status === 'ไม่อนุมัติ' ? 'bad-t' : 'warn-t') + '</div></div>';
-  h += '<div class="card"><h2>เอกสารและภาพที่แนบ</h2>' + filesBlock('submittal', sid, true, true) + '</div>';
+  h += '<div class="card"><h2>เอกสารและภาพที่แนบ</h2>' + filesBlock('submittal', sid, true, true) + '</div>' + aiCard(s, S._aiCfg || {});
   h += '<div class="card"><div class="between"><h2 style="margin:0">ตรวจเทียบข้อกำหนด (' + cr.length + ' ข้อ)</h2><div class="row">' +
     (cr.length ? '<button class="btn sm sec" data-chkall="ไม่เกี่ยวข้อง">ข้อที่ยังไม่ตรวจ = ไม่เกี่ยวข้อง</button>' : '') + '</div></div>' +
     (!cr.length ? '<p class="muted">ยังไม่ได้กำหนดเกณฑ์ – กด "แก้ไข" เพื่อเลือกหมวดตามรายการประกอบแบบ หรือพิมพ์ข้อกำหนดเอง</p>' :
@@ -1039,21 +1139,28 @@ async function vApp() {
   var theme = document.documentElement.dataset.theme || 'auto';
   var standalone = window.matchMedia && matchMedia('(display-mode: standalone)').matches;
   var ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
-  return '<div class="card"><h2>การแสดงผล</h2><div class="seg" id="themeSeg">' + [['auto', '🌓 ตามเครื่อง'], ['light', '☀️ สว่าง'], ['dark', '🌙 มืด']].map(function (x) {
+  var ai = await aiCfg(), used = num((ai.used || {})[iso(today())]);
+  var aiHtml = '<div class="card"><h2>AI ตรวจสเปกวัสดุ (Claude API)</h2>' +
+    (aiSandboxed() ? '<div class="banner warn">' + ic('alert') + '<span class="grow">หน้าทดลองนี้ไม่อนุญาตให้เชื่อมต่อภายนอก – AI ใช้ได้เมื่อเปิดแอปจาก GitHub Pages</span></div>' : '') +
+    '<p class="muted">แอปส่งเอกสารแนบของรายการขออนุมัติไปให้ Claude ตรวจเทียบข้อกำหนดโดยตรงจากเครื่องนี้ • API key เก็บเฉพาะในเครื่องนี้ ไม่รวมอยู่ในไฟล์สำรอง • มีค่าใช้จ่ายตามการใช้งาน (ดูที่ console.anthropic.com)</p>' +
+    '<div class="grid3">' + inp('aiKey', 'API key (sk-ant-…)', ai.key ? '••••••••' + ai.key.slice(-6) : '', 'password', 'autocomplete="off"') + inp('aiModel', 'โมเดล', ai.model || AI_DEFAULT_MODEL) + inp('aiLimit', 'จำกัดจำนวนครั้งต่อวัน', ai.limit, 'number', 'min="1"') + '</div>' +
+    '<p class="muted">ใช้วันนี้ ' + used + ' / ' + ai.limit + ' ครั้ง • สถานะ: ' + (ai.key ? '<span class="ok-t">ตั้งค่าแล้ว</span>' : 'ยังไม่ได้ตั้งค่า') + '</p>' +
+    '<div class="row"><button class="btn" data-act="aiSave">บันทึก</button><button class="btn sec" data-act="aiTest" ' + (ai.key ? '' : 'disabled') + '>ทดสอบการเชื่อมต่อ</button>' + (ai.key ? '<button class="btn ghost bad-t" data-act="aiClear">ลบ API key</button>' : '') + '</div></div>';
+  return pageHead('ตั้งค่าและสำรองข้อมูล', 'การแสดงผล การสำรอง/กู้คืน AI และการติดตั้งแอป', '') + '<div class="card"><h2>การแสดงผล</h2><div class="seg" id="themeSeg">' + [['auto', 'ตามเครื่อง'], ['light', 'สว่าง'], ['dark', 'มืด']].map(function (x) {
       return '<button data-theme="' + x[0] + '" class="' + (theme === x[0] ? 'on' : '') + '">' + x[1] + '</button>'; }).join('') + '</div></div>' +
-    '<div class="card"><h2>💾 สำรองและกู้คืนข้อมูล</h2><p>ข้อมูลทั้งหมดเก็บในเครื่องนี้เท่านั้น (ไม่ได้ส่งขึ้นอินเทอร์เน็ต) ถ้าล้างข้อมูลเบราว์เซอร์ เปลี่ยนเครื่อง หรือเครื่องเสีย ข้อมูลจะหาย – <b>ควรสำรองสัปดาห์ละครั้ง</b> แล้วเก็บไฟล์ไว้ใน Google Drive/OneDrive</p>' +
+    '<div class="card"><h2>สำรองและกู้คืนข้อมูล</h2><p>ข้อมูลทั้งหมดเก็บในเครื่องนี้เท่านั้น (ไม่ได้ส่งขึ้นอินเทอร์เน็ต) ถ้าล้างข้อมูลเบราว์เซอร์ เปลี่ยนเครื่อง หรือเครื่องเสีย ข้อมูลจะหาย – <b>ควรสำรองสัปดาห์ละครั้ง</b> แล้วเก็บไฟล์ไว้ใน Google Drive/OneDrive</p>' +
     '<p class="muted">สำรองครั้งล่าสุด: ' + (lastBk ? th(lastBk.slice(0, 10)) + ' ' + lastBk.slice(11, 16) + ' น.' : '<span class="bad-t">ยังไม่เคยสำรอง</span>') + '</p>' +
-    '<div class="row"><button class="btn acc" data-act="backup">💾 สำรองข้อมูลทั้งหมด (รวมรูป)</button><button class="btn sec" data-act="backupLite">สำรองแบบไม่รวมรูป</button>' +
-    '<label class="btn sec" style="display:inline-block">📂 กู้คืนจากไฟล์<input type="file" class="hidden" id="restoreFile" accept=".json,application/json"></label></div>' +
+    '<div class="row"><button class="btn acc" data-act="backup">สำรองข้อมูลทั้งหมด (รวมรูป)</button><button class="btn sec" data-act="backupLite">สำรองแบบไม่รวมรูป</button>' +
+    '<label class="btn sec" style="display:inline-block">กู้คืนจากไฟล์<input type="file" class="hidden" id="restoreFile" accept=".json,application/json"></label></div>' +
     '<p class="muted">ย้ายไปเครื่องใหม่: สำรองในเครื่องเดิม → เปิดแอปในเครื่องใหม่ → กู้คืนจากไฟล์</p></div>' +
-    '<div class="card"><h2>พื้นที่จัดเก็บ</h2><p>' + (est ? 'ใช้ไป ' + (est.usage / 1048576).toFixed(1) + ' MB จากที่ใช้ได้ประมาณ ' + (est.quota / 1073741824).toFixed(1) + ' GB' : 'ไม่ทราบขนาด') + '</p>' +
+    aiHtml + '<div class="card"><h2>พื้นที่จัดเก็บ</h2><p>' + (est ? 'ใช้ไป ' + (est.usage / 1048576).toFixed(1) + ' MB จากที่ใช้ได้ประมาณ ' + (est.quota / 1073741824).toFixed(1) + ' GB' : 'ไม่ทราบขนาด') + '</p>' +
     '<p class="muted">การป้องกันการลบอัตโนมัติ: ' + (persisted ? '<span class="ok-t">✓ เปิดแล้ว</span>' : 'ยังไม่เปิด <button class="btn sm sec" data-act="persist">ขอเปิด</button>') + ' – ช่วยไม่ให้เบราว์เซอร์ลบข้อมูลเองเมื่อพื้นที่เครื่องเหลือน้อย</p></div>' +
     '<div class="card"><h2>ติดตั้งเป็นแอป</h2>' + (standalone ? '<p class="ok-t">✓ กำลังใช้งานแบบแอปที่ติดตั้งแล้ว</p>' :
-      (S.deferredInstall ? '<button class="btn" data-act="install">⬇ ติดตั้งลงเครื่องนี้</button>' : '') +
-      '<p class="muted">' + (ios ? 'iPhone/iPad: เปิดใน Safari → ปุ่มแชร์ ⬆ → "เพิ่มไปยังหน้าจอโฮม"' : 'คอมพิวเตอร์ (Chrome/Edge): กดไอคอน ⊕ ท้ายช่องที่อยู่เว็บ หรือเมนู ⋮ → "ติดตั้งแอป" • Android (Chrome): เมนู ⋮ → "ติดตั้งแอป" / "เพิ่มลงในหน้าจอหลัก"') + '</p>') +
+      (S.deferredInstall ? '<button class="btn" data-act="install">ติดตั้งลงเครื่องนี้</button>' : '') +
+      '<p class="muted">' + (ios ? 'iPhone/iPad: เปิดใน Safari → ปุ่มแชร์ → "เพิ่มไปยังหน้าจอโฮม"' : 'คอมพิวเตอร์ (Chrome/Edge): กดไอคอน ⊕ ท้ายช่องที่อยู่เว็บ หรือเมนู ⋮ → "ติดตั้งแอป" • Android (Chrome): เมนู ⋮ → "ติดตั้งแอป" / "เพิ่มลงในหน้าจอหลัก"') + '</p>') +
     '<p class="muted">ติดตั้งแล้วเปิดจากไอคอนได้เหมือนโปรแกรม และใช้งานได้แม้ไม่มีอินเทอร์เน็ต</p></div>' +
     '<div class="card"><h2>เกี่ยวกับ</h2><p>คุมงานก่อสร้าง เวอร์ชัน ' + APP_VERSION + ' • ข้อมูลรายการประกอบแบบ: ' + esc((window.SPEC && SPEC.source) || '-') + ' (' + ((window.SPEC && SPEC.items.length) || 0) + ' ข้อ)</p>' +
-    '<button class="btn sec" data-act="sample">➕ สร้างโครงการตัวอย่าง</button> <button class="btn sm ghost bad-t" data-act="wipe">ล้างข้อมูลทั้งหมด</button></div>';
+    '<button class="btn sec" data-act="sample">สร้างโครงการตัวอย่าง</button> <button class="btn sm ghost bad-t" data-act="wipe">ล้างข้อมูลทั้งหมด</button></div>';
 }
 function b64FromBlob(b) { return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(String(r.result).split(',')[1] || ''); }; r.onerror = function () { rej(r.error); }; r.readAsDataURL(b); }); }
 function blobFromB64(b64, mime) { var bin = atob(b64), a = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return new Blob([a], { type: mime }); }
@@ -1132,7 +1239,7 @@ function exportXlsx() {
 
 /* ---------------- EVENTS ---------------- */
 document.addEventListener('click', async function (e) {
-  var el = e.target.closest('[data-go],[data-act],[data-prog],[data-task],[data-tf],[data-tp],[data-open],[data-fdel],[data-sub],[data-addrow],[data-ldel],[data-fill],[data-wph],[data-chkall],[data-theme]');
+  var el = e.target.closest('[data-go],[data-act],[data-prog],[data-task],[data-tf],[data-tp],[data-open],[data-fdel],[data-sub],[data-addrow],[data-ldel],[data-fill],[data-wph],[data-chkall],[data-theme],[data-inst],[data-vo],[data-eot]');
   if (!el) return;
   try {
     if (el.dataset.open) return openFile(el.dataset.open);
@@ -1143,6 +1250,9 @@ document.addEventListener('click', async function (e) {
     if (el.dataset.tf != null) { TF.st = el.dataset.tf; return render(); }
     if (el.dataset.tp != null) { TF.part = el.dataset.tp; return render(); }
     if (el.dataset.sub) return openSub(el.dataset.sub === 'new' ? null : el.dataset.sub);
+    if (el.dataset.inst != null) return openInst(el.dataset.inst || null);
+    if (el.dataset.vo != null) return openVO(el.dataset.vo || null);
+    if (el.dataset.eot != null) return openEOT(el.dataset.eot || null);
     if (el.dataset.theme) { var t = el.dataset.theme; if (t === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t; try { localStorage.setItem('sc_theme', t); } catch (x) {} return render(); }
     if (el.dataset.fdel) {
       if (!(await confirmBox('ลบไฟล์นี้?', 'ลบ'))) return;
@@ -1177,6 +1287,24 @@ document.addEventListener('click', async function (e) {
       }, 'ลบถาวร');
     }
     else if (a === 'exportXlsx') await exportXlsx();
+    else if (a === 'exportV4') { el.disabled = true; var old = el.innerHTML; el.innerHTML = '<span class="spin"></span> กำลังสร้างไฟล์…'; try { await exportV4(); } finally { el.disabled = false; el.innerHTML = old; } }
+    else if (a === 'finSet') openFinSet();
+    else if (a === 'printDash') go('/p/' + S.P.id + '/print/dash/0');
+    else if (a === 'aiSave') { var cfg = await aiCfg(), k = $('#aiKey').value.trim(); if (k && k.indexOf('••') !== 0) { if (!/^sk-ant-/.test(k)) throw new Error('API key ต้องขึ้นต้นด้วย sk-ant-'); cfg.key = k; }
+      cfg.model = $('#aiModel').value.trim() || AI_DEFAULT_MODEL; cfg.limit = Math.max(1, Math.round(num($('#aiLimit').value) || 30)); await meta('ai', cfg); toast('บันทึกการตั้งค่า AI แล้ว'); render(); }
+    else if (a === 'aiTest') { var c2 = await aiCfg(); if (aiSandboxed()) throw new Error('หน้าทดลองนี้ไม่อนุญาตให้เชื่อมต่อภายนอก'); el.disabled = true; try { toast(await aiTest(c2.key, c2.model), false, 4000); } finally { el.disabled = false; } }
+    else if (a === 'aiClear') { if (await confirmBox('ลบ API key ออกจากเครื่องนี้?', 'ลบ')) { var c3 = await aiCfg(); c3.key = ''; await meta('ai', c3); render(); } }
+    else if (a === 'aiRun') {
+      var sa = S.submittals.filter(function (x) { return x.id === S.route[3]; })[0];
+      if (!(await confirmBox('ส่งเอกสารแนบ ' + filesOf('submittal', sa.id).length + ' ไฟล์ให้ AI ตรวจเทียบข้อกำหนด? (มีค่าใช้จ่าย API ประมาณ 20–60 วินาที)', 'ตรวจด้วย AI'))) return;
+      el.disabled = true; el.innerHTML = '<span class="spin"></span> AI กำลังตรวจ…';
+      try { await aiCheck(sa); toast('AI ตรวจเสร็จแล้ว'); render(); } catch (er) { el.disabled = false; el.innerHTML = ic('spark') + 'ตรวจด้วย AI'; throw er; }
+    }
+    else if (a === 'aiApply') {
+      var sp = S.submittals.filter(function (x) { return x.id === S.route[3]; })[0], n = 0; sp.checks = sp.checks || {};
+      (sp.ai.items || []).forEach(function (x) { var c = sp.checks[x.key]; if (!c || !c.v) { sp.checks[x.key] = { v: x.verdict, note: (c && c.note) || ('AI: ' + x.found) }; n++; } });
+      await DB.put('submittals', sp); toast('ใส่ผล AI ใน ' + n + ' ข้อที่ยังไม่ตรวจ – กรุณาตรวจทานก่อนพิจารณา'); render();
+    }
     else if (a === 'openDay') { var dv = $('#dPick').value; if (D(dv)) go('/p/' + S.P.id + '/daily/' + dv); }
     else if (a === 'copyPrev') { var pr = dailyOf(el.dataset.date); S.dailyDraft.manpower = JSON.parse(JSON.stringify(pr.manpower || [])); S.dailyDraft.machinery = JSON.parse(JSON.stringify(pr.machinery || [])); await saveDaily(); toast('คัดลอกคนงานและเครื่องจักรแล้ว'); render(); }
     else if (a === 'delDaily') { var di = el.dataset.date; if (!(await confirmBox('ลบรายงานประจำวันที่ ' + th(di) + ' (รวมรูป และผลงานที่บันทึกจากรายงานนี้)?', 'ลบ'))) return;
@@ -1194,7 +1322,7 @@ document.addEventListener('click', async function (e) {
       sb.status = $('#dSt').value; sb.approved_date = $('#dAp').value || (sb.status === 'อนุมัติ' ? iso(today()) : ''); sb.remark = $('#dRm').value.trim(); sb.updated = new Date().toISOString();
       await DB.put('submittals', sb); toast('บันทึกผลพิจารณาแล้ว'); render();
     }
-  } catch (err) { console.error(err); toast(err.message, true); }
+  } catch (err) { toast(err.message, true); }
 });
 document.addEventListener('keydown', function (e) { if ((e.key === 'Enter' || e.key === ' ') && e.target.classList && e.target.classList.contains('pcard')) { e.preventDefault(); e.target.click(); } });
 var _qT = null;
@@ -1221,7 +1349,7 @@ document.addEventListener('change', async function (e) {
       s.updated = new Date().toISOString(); await DB.put('submittals', s); return;
     }
     if (t.id === 'restoreFile' && t.files[0]) { await doRestore(t.files[0]); t.value = ''; return; }
-  } catch (err) { console.error(err); toast(err.message, true); }
+  } catch (err) { toast(err.message, true); }
 });
 window.addEventListener('hashchange', function () {
   var pend = [];
@@ -1234,8 +1362,8 @@ $('#installBtn').addEventListener('click', function () { if (S.deferredInstall) 
 $('#menuBtn').addEventListener('click', function () {
   var inP = !!S.P, pid = inP ? S.P.id : '';
   var b = function (go_, t) { return '<button class="btn sec" style="width:100%;text-align:left;margin-bottom:6px" ' + go_ + '>' + t + '</button>'; };
-  var bg = modal('<h2>เมนู</h2>' + b('data-go="/"', '🏠 ทุกโครงการ') + (inP ? b('data-go="/p/' + pid + '/set"', '⚙️ ตั้งค่าโครงการนี้') + b('data-act="exportXlsx"', '📥 ส่งออก Excel (โครงการนี้)') : '') +
-    b('data-act="backup"', '💾 สำรองข้อมูลทั้งหมด') + b('data-go="/app"', '🔧 ตั้งค่าแอป / กู้คืนข้อมูล / ติดตั้ง'));
+  var bg = modal('<h2>เมนู</h2>' + b('data-go="/"', ic('folder') + ' โครงการทั้งหมด') + (inP ? b('data-go="/p/' + pid + '/set"', ic('settings') + ' ตั้งค่าโครงการนี้') + b('data-act="exportV4"', ic('excel') + ' ส่งออกรายงาน Excel (รูปแบบ v4)') + b('data-act="exportXlsx"', ic('download') + ' ส่งออกข้อมูลดิบ Excel') : '') +
+    b('data-act="backup"', ic('backup') + ' สำรองข้อมูลทั้งหมด') + b('data-go="/app"', ic('settings') + ' ตั้งค่าแอป / AI / กู้คืน / ติดตั้ง'));
   bg.addEventListener('click', function (e) { if (e.target.closest('[data-go],[data-act]')) setTimeout(function () { bg.remove(); }, 0); });
 });
 window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); S.deferredInstall = e; $('#installBtn').classList.remove('hidden'); });
@@ -1278,7 +1406,7 @@ async function createSample() {
   for (var k = 5; k >= 0; k--) {
     var d = addDays(t0, -k); if (d.getDay() === 0) continue;
     var rain = k === 3, di = iso(d);
-    daily.push({ id: pid + '_' + di, projectId: pid, date: di, weatherAM: rain ? '🌧️ ฝนตกหนัก' : '☀️ แจ่มใส', weatherPM: rain ? '🌦️ ฝนเล็กน้อย' : '⛅ มีเมฆ', status: rain ? 'หยุดงาน (ฝนตก)' : 'ทำงานได้ตามปกติ',
+    daily.push({ id: pid + '_' + di, projectId: pid, date: di, weatherAM: rain ? 'ฝนตกหนัก' : 'แจ่มใส', weatherPM: rain ? 'ฝนเล็กน้อย' : 'มีเมฆ', status: rain ? 'หยุดงาน (ฝนตก)' : 'ทำงานได้ตามปกติ',
       manpower: rain ? [{ trade: 'โฟร์แมน', count: 1 }] : [{ trade: 'โฟร์แมน', count: 1 }, { trade: 'ช่างเหล็ก', count: 6 }, { trade: 'ช่างปูน', count: 5 }, { trade: 'กรรมกร', count: 14 + k }],
       machinery: rain ? [] : [{ name: 'ปั้นจั่นตอกเข็ม', count: 1 }, { name: 'รถแบ็คโฮ', count: 2 }],
       work: rain ? 'หยุดงานเนื่องจากฝนตกหนัก' : 'ตอกเสาเข็มอาคาร ' + (4 + k) + ' ต้น • วางรางระบายน้ำ คสล. ' + (10 + k * 2) + ' ม. • หล่อฐานรากรั้ว ' + (2 + k % 3) + ' ฐาน',
@@ -1293,7 +1421,15 @@ async function createSample() {
   var subs = [{ id: pid + 's1', projectId: pid, doc_no: 'SM-001', material: 'คอนกรีตผสมเสร็จ 240 ksc', brand: '(ตัวอย่าง) ยี่ห้อ A', taskId: pid + 't4', lead_days: '7', spec_sec: '03 31 00', submitted_date: sd(105), status: 'อนุมัติ', approved_date: sd(110), checks: {}, updated: now },
     { id: pid + 's2', projectId: pid, doc_no: 'SM-002', material: 'เหล็กข้ออ้อย SD40', brand: '(ตัวอย่าง) ยี่ห้อ B', taskId: pid + 't4', lead_days: '14', spec_sec: '03 21 00', submitted_date: sd(108), status: 'ขอเอกสารเพิ่มเติม', remark: 'ขอใบ Mill Certificate', checks: {}, updated: now }];
   var cr = criteriaOf(subs[1]); if (cr[0]) subs[1].checks[cr[0].key] = { v: 'ผ่าน', note: 'แคตตาล็อกระบุ มอก. 24 ชั้นคุณภาพ SD40' }; if (cr[1]) subs[1].checks[cr[1].key] = { v: 'ไม่พบข้อมูล', note: 'ไม่มีใบรับรองผลการทดสอบ' };
-  await DB.put('projects', p); await DB.putMany('tasks', tasks); await DB.putMany('progress', prog); await DB.putMany('daily', daily); await DB.putMany('files', files); await DB.putMany('submittals', subs);
+  p.fin = { adv: 15, ret: 5, kUse: true, kThr: 4, k: K_DEFAULT, ldRate: 0.10, ldMin: 100, ldCap: 10 };
+  var inst = [['1', 'งานถมดินและปรับพื้นที่แล้วเสร็จทั้งหมด', 12, 91, 3630000, [104.2, 101.5, 106.8, 112.0]], ['2', 'งานรางระบายน้ำ เสาเข็มอาคาร ฐานรากรั้วแล้วเสร็จ', 30, 152, 4840000],
+    ['3', 'งานโครงสร้างอาคาร ถนน-ลาน และรั้วแล้วเสร็จ', 60, 228, 6050000], ['4', 'งานสถาปัตยกรรมอาคารและโรงจอดรถแล้วเสร็จ', 85, 272, 4840000], ['5', 'งานทั้งหมดแล้วเสร็จ ทดสอบระบบ ส่งมอบงาน', 100, 299, 4840000]]
+    .map(function (x, i) { return { id: pid + 'i' + i, projectId: pid, no: x[0], scope: x[1], req_pct: String(x[2]), due: sd(x[3]), amount: String(x[4]), it: x[5] || null, updated: now }; });
+  var vos = [{ id: pid + 'v1', projectId: pid, doc_no: 'VO-01/2569', date: sd(96), desc: 'แก้ไขแบบบ่อพักและท่อลอด เพิ่มบ่อพัก 4 บ่อ', taskId: pid + 't12', type: 'งานเพิ่ม', amount: '380000', status: 'อนุมัติ', approved_amount: '352000', approved_date: sd(111), days: '8', updated: now },
+    { id: pid + 'v2', projectId: pid, doc_no: 'VO-02/2569', date: sd(109), desc: 'ปรับลดความยาวรั้วด้านทิศเหนือ 40 ม.', taskId: pid + 't17', type: 'งานลด', amount: '120000', status: 'รอพิจารณา', updated: now }];
+  var eots = [{ id: pid + 'e1', projectId: pid, date: sd(96), desc: 'ผู้ว่าจ้างแก้ไขแบบบ่อพักและท่อลอด', taskId: pid + 't12', cause: 'ผู้ว่าจ้าง', days_claimed: '10', letter_ref: 'ผร.002/2569', submitted: sd(101), status: 'อนุมัติบางส่วน', days_approved: '8', updated: now },
+    { id: pid + 'e2', projectId: pid, date: sd(57), desc: 'ฝนตกหนักต่อเนื่อง บดอัดดินไม่ได้', cause: 'เหตุสุดวิสัย', days_claimed: '7', letter_ref: 'ผร.001/2569', submitted: sd(63), status: 'รอพิจารณา', updated: now }];
+  await DB.put('projects', p); await DB.putMany('tasks', tasks); await DB.putMany('installments', inst); await DB.putMany('vos', vos); await DB.putMany('eots', eots); await DB.putMany('progress', prog); await DB.putMany('daily', daily); await DB.putMany('files', files); await DB.putMany('submittals', subs);
   toast('สร้างโครงการตัวอย่างแล้ว'); return pid;
 }
 
@@ -1311,8 +1447,9 @@ function registerSW() {
       });
     });
   }).catch(function (e) { console.warn('SW', e); });
-  var reloaded = false;
-  navigator.serviceWorker.addEventListener('controllerchange', function () { if (!reloaded) { reloaded = true; location.reload(); } });
+  // โหลดหน้าใหม่เฉพาะเมื่อ "อัปเดตจากเวอร์ชันเดิม" (ไม่โหลดใหม่ตอนติดตั้งครั้งแรก เพื่อไม่ให้ข้อมูลที่กำลังกรอกหาย)
+  var hadController = !!navigator.serviceWorker.controller, reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', function () { if (hadController && !reloaded) { reloaded = true; location.reload(); } });
 }
 (async function start() {
   try { await openDB(); } catch (e) { $('#main').innerHTML = '<div class="card"><h2>เปิดฐานข้อมูลไม่ได้</h2><p>' + esc(e.message) + '</p><p class="muted">ถ้าใช้โหมดไม่ระบุตัวตน (Incognito) ให้เปิดแบบปกติ</p></div>'; return; }
@@ -1321,4 +1458,463 @@ function registerSW() {
   var tries = 0; while (!window.Chart && tries++ < 20) await new Promise(function (r) { setTimeout(r, 50); });
   render();
 })();
+
+/* ---------------- CONTRACT & FINANCE ---------------- */
+var EOT_CAUSE = ['ผู้ว่าจ้าง', 'เหตุสุดวิสัย', 'ผู้รับจ้าง', 'อื่นๆ'];
+var EOT_ST = ['รอพิจารณา', 'อนุมัติ', 'อนุมัติบางส่วน', 'ไม่อนุมัติ'];
+var VO_ST = ['รอพิจารณา', 'อนุมัติ', 'ไม่อนุมัติ'];
+function sortedInst() { return S.installments.slice().sort(function (a, b) { return num(a.no) - num(b.no); }); }
+async function vFin(args) {
+  var tab = args[0] || 'inst', p = S.P, L = ldInfo(), pid = p.id;
+  var tabs = [['inst', 'งวดงานและเงินงวด'], ['vo', 'งานเพิ่ม-ลด (VO)'], ['eot', 'ขยายเวลาและค่าปรับ']];
+  var h = pageHead('สัญญาและการเงิน', 'มูลค่าสัญญา งวดงาน การเบิกจ่าย งานเพิ่ม-ลด และการขยายเวลา',
+    '<button class="btn sec" data-act="finSet">' + ic('settings') + 'เงื่อนไขสัญญา</button>') +
+    '<div class="kpis">' + kpi('มูลค่าสัญญาเดิม', money(p.bac)) + kpi('งานเพิ่ม-ลดสุทธิ', (voNet() >= 0 ? '+' : '') + money(voNet()), 'เฉพาะที่อนุมัติ', voNet() < 0 ? 'bad-t' : '') +
+    kpi('มูลค่าสัญญาปัจจุบัน', money(num(p.bac) + voNet())) + kpi('สิ้นสุดสัญญา', th(projEnd(), true), 'รวมขยายเวลา ' + eotTotal() + ' วัน') +
+    kpi('ค่าปรับคาดการณ์', L.fLd == null ? '-' : money(L.fLd), L.fDelay ? 'ช้ากว่าสัญญา ' + L.fDelay + ' วัน' : 'คาดว่าทันสัญญา', L.fDelay ? 'bad-t' : 'ok-t') + '</div>' +
+    '<div class="tabs" role="tablist">' + tabs.map(function (t) { return '<button role="tab" aria-selected="' + (t[0] === tab) + '" class="' + (t[0] === tab ? 'on' : '') + '" data-go="/p/' + pid + '/fin/' + t[0] + '">' + t[1] + '</button>'; }).join('') + '</div>';
+  return h + ({ inst: finInst, vo: finVO, eot: finEOT }[tab] || finInst)();
+}
+function finInst() {
+  var list = sortedInst(), ac = actualNow(), F = fin(), tot = { amt: 0, kadj: 0, adv: 0, ret: 0, ld: 0, net: 0 };
+  var h = '<div class="card"><div class="card-h"><h2>งวดงานตามสัญญา</h2><button class="btn" data-inst="">' + ic('plus') + 'เพิ่มงวด</button></div>' +
+    '<p class="muted">เงินล่วงหน้า ' + F.adv + '% • ประกันผลงาน ' + F.ret + '% • ค่า K: ' + (F.kUse ? 'ใช้ (คิดส่วนที่เกิน ±' + F.kThr + '%)' : 'ไม่ใช้') + ' • ยอดสุทธิยังไม่รวมภาษี</p>';
+  if (!list.length) return h + '<div class="empty">ยังไม่มีงวดงาน – กด "เพิ่มงวด" เพื่อบันทึกตามสัญญา</div></div>';
+  h += '<div class="tw"><table class="tbl"><thead><tr><th>งวด</th><th>เนื้องาน</th><th>กำหนดเสร็จ</th><th class="num">มูลค่างาน</th><th>เกณฑ์ผลงาน</th><th>สถานะ</th><th class="num">ค่า K</th><th class="num">เงิน K</th><th class="num">หักล่วงหน้า</th><th class="num">หักประกัน</th><th class="num">ค่าปรับ</th><th class="num">สุทธิ</th><th class="noprint"></th></tr></thead><tbody>';
+  list.forEach(function (i) {
+    var p = payOf(i), rq = i.req_pct !== '' && i.req_pct != null ? (ac * 100 >= num(i.req_pct) ? { k: 'ok', t: 'ถึงเกณฑ์ ' + num(i.req_pct) + '%' } : { k: 'na', t: 'ขาด ' + (num(i.req_pct) - ac * 100).toFixed(2) + '%' }) : { k: 'na', t: '-' };
+    ['amt', 'kadj', 'adv', 'ret', 'ld', 'net'].forEach(function (x) { tot[x] += p[x]; });
+    h += '<tr><td>' + esc(i.no) + '</td><td>' + esc(i.scope) + (num(i.vo_amount) ? '<div class="muted">รวม VO ' + money(i.vo_amount) + '</div>' : '') + '</td><td>' + th(i.due, true) +
+      (i.submitted ? '<div class="muted">ส่งมอบ ' + th(i.submitted, true) + '</div>' : '') + (i.accepted ? '<div class="muted">ตรวจรับ ' + th(i.accepted, true) + '</div>' : '') + '</td>' +
+      '<td class="num">' + money(p.amt) + '</td><td>' + badge(rq) + '</td><td>' + badge(instStatus(i)) + '</td><td class="num">' + (p.K == null ? '-' : p.K.toFixed(4)) + '</td>' +
+      '<td class="num ' + (p.kadj < 0 ? 'bad-t' : p.kadj > 0 ? 'ok-t' : '') + '">' + (p.K == null ? '-' : money(p.kadj)) + '</td><td class="num">' + money(p.adv) + '</td><td class="num">' + money(p.ret) + '</td>' +
+      '<td class="num">' + money(p.ld) + '</td><td class="num"><b>' + money(p.net) + '</b></td><td class="noprint nowrap"><button class="btn sm sec" data-inst="' + i.id + '">แก้ไข</button> ' +
+      '<button class="btn sm ghost" data-go="/p/' + S.P.id + '/print/pay/' + i.id + '" title="พิมพ์ใบสรุปเงินงวด">' + ic('print') + '</button></td></tr>';
+  });
+  h += '</tbody><tfoot><tr><td colspan="3">รวม</td><td class="num">' + money(tot.amt) + '</td><td></td><td></td><td></td><td class="num">' + money(tot.kadj) + '</td><td class="num">' + money(tot.adv) + '</td><td class="num">' + money(tot.ret) + '</td><td class="num">' + money(tot.ld) + '</td><td class="num">' + money(tot.net) + '</td><td class="noprint"></td></tr></tfoot></table></div>';
+  var diff = tot.amt - list.reduce(function (a, i) { return a + num(i.vo_amount); }, 0) - num(S.P.bac);
+  if (Math.abs(diff) >= 1 && num(S.P.bac)) h += '<p class="bad-t">ยอดรวมงวด (ไม่รวม VO) ต่างจากมูลค่าสัญญา ' + money(diff) + ' บาท</p>';
+  var accAdv = list.filter(function (i) { return i.accepted; }).reduce(function (a, i) { return a + payOf(i).adv; }, 0);
+  var accRet = list.filter(function (i) { return i.accepted; }).reduce(function (a, i) { return a + payOf(i).ret; }, 0);
+  h += '<div class="kpis" style="margin-top:12px">' + kpi('เงินล่วงหน้าคงเหลือ', money(num(S.P.bac) * F.adv / 100 - accAdv), 'หลังงวดที่ตรวจรับแล้ว') + kpi('เงินประกันผลงานที่หักไว้', money(accRet), 'งวดที่ตรวจรับแล้ว') +
+    kpi('จ่ายสุทธิแล้ว', money(list.filter(function (i) { return i.accepted; }).reduce(function (a, i) { return a + payOf(i).net; }, 0)), list.filter(function (i) { return i.accepted; }).length + ' งวด') + '</div>';
+  return h + '</div>';
+}
+function finVO() {
+  var list = S.vos.slice().sort(function (a, b) { return (a.date || '') < (b.date || '') ? -1 : 1; });
+  var h = '<div class="card"><div class="card-h"><h2>ทะเบียนงานเพิ่ม-ลด</h2><button class="btn" data-vo="">' + ic('plus') + 'บันทึกงานเพิ่ม-ลด</button></div>' +
+    '<p class="muted">เฉพาะรายการที่อนุมัติจะปรับมูลค่าสัญญา • งานเพิ่มที่อนุมัติควรเพิ่มเป็นรายการงานใหม่ในแผนงานด้วย • ถ้ากระทบเวลา ให้บันทึกขอขยายเวลา</p>';
+  if (!list.length) return h + '<div class="empty">ยังไม่มีรายการ</div></div>';
+  h += '<div class="tw"><table class="tbl"><thead><tr><th>เลขที่</th><th>วันที่</th><th>รายละเอียด</th><th>ประเภท</th><th class="num">เสนอ</th><th class="num">อนุมัติ</th><th>ผลพิจารณา</th><th class="noprint"></th></tr></thead><tbody>';
+  list.forEach(function (v) { var t = taskById(v.taskId);
+    h += '<tr><td>' + esc(v.doc_no) + '</td><td>' + th(v.date, true) + '</td><td>' + esc(v.desc) + (t ? '<div class="muted">' + esc(wbsOf(t.id) + ' ' + t.desc) + '</div>' : '') + (num(v.days) ? '<div class="muted">ผลต่อเวลา ' + num(v.days) + ' วัน</div>' : '') + '</td>' +
+      '<td>' + esc(v.type) + '</td><td class="num">' + money(v.amount) + '</td><td class="num">' + (v.status === 'อนุมัติ' ? money(v.approved_amount !== '' && v.approved_amount != null ? v.approved_amount : v.amount) : '-') + '</td>' +
+      '<td>' + badge({ k: v.status === 'อนุมัติ' ? 'ok' : v.status === 'ไม่อนุมัติ' ? 'bad' : 'warn', t: v.status }) + '</td><td class="noprint"><button class="btn sm sec" data-vo="' + v.id + '">แก้ไข</button></td></tr>'; });
+  return h + '</tbody></table></div></div>';
+}
+function finEOT() {
+  var L = ldInfo(), F = fin(), list = S.eots.slice().sort(function (a, b) { return (a.date || '') < (b.date || '') ? -1 : 1; });
+  var pend = list.filter(function (e) { return e.status === 'รอพิจารณา'; }).reduce(function (a, e) { return a + num(e.days_claimed); }, 0);
+  var h = '<div class="card"><h2>ค่าปรับ (Liquidated Damages)</h2><div class="kpis">' +
+    kpi('ค่าปรับต่อวัน', money(L.per), 'อัตรา ' + F.ldRate + '% ขั้นต่ำ ' + money(F.ldMin)) +
+    kpi('ค่าปรับเกิดขึ้นแล้ว', money(L.incurred), L.late ? 'เลยกำหนด ' + L.late + ' วัน' : 'ยังไม่ถึงกำหนดสัญญา', L.late ? 'bad-t' : 'ok-t') +
+    kpi('คาดว่าแล้วเสร็จ', L.fEnd ? th(L.fEnd, true) : '-', 'จากอัตราผลงานเฉลี่ย') +
+    kpi('ค่าปรับคาดการณ์', L.fLd == null ? '-' : money(L.fLd), L.overCap ? 'เกิน ' + F.ldCap + '% ของสัญญา – เสี่ยงถูกบอกเลิก' : (L.fDelay ? 'ช้ากว่าสัญญา ' + L.fDelay + ' วัน' : ''), L.fDelay ? 'bad-t' : 'ok-t') + '</div>' +
+    '<p class="muted">ค่าปรับคาดการณ์ต่อเส้นตรงจากอัตราผลงานเฉลี่ย ใช้เป็นสัญญาณเตือนล่วงหน้า ไม่ใช่ยอดที่เรียกเก็บจริง</p></div>';
+  h += '<div class="card"><div class="card-h"><h2>ทะเบียนขอขยายเวลา</h2><button class="btn" data-eot="">' + ic('plus') + 'บันทึกเหตุการณ์ล่าช้า</button></div>' +
+    '<p class="muted">อนุมัติแล้ว <b>' + eotApproved() + '</b> วัน' + (num(S.P.eot_days) ? ' (+ นอกทะเบียน ' + num(S.P.eot_days) + ' วัน)' : '') + ' • รอพิจารณา <b>' + pend + '</b> วัน • วันที่อนุมัติจะเลื่อนวันสิ้นสุดสัญญาอัตโนมัติ</p>';
+  if (!list.length) return h + '<div class="empty">ยังไม่มีรายการ</div></div>';
+  h += '<div class="tw"><table class="tbl"><thead><tr><th>วันที่</th><th>เหตุการณ์</th><th>สาเหตุจาก</th><th class="num">ขอ (วัน)</th><th>เลขที่หนังสือ</th><th>ผลพิจารณา</th><th class="num">อนุมัติ (วัน)</th><th class="noprint"></th></tr></thead><tbody>';
+  list.forEach(function (e) { var ok = e.status === 'อนุมัติ' || e.status === 'อนุมัติบางส่วน';
+    h += '<tr><td>' + th(e.date, true) + '</td><td>' + esc(e.desc) + (e.cause === 'ผู้รับจ้าง' ? '<div class="muted bad-t">ผู้รับจ้างรับผิดชอบ – ไม่มีสิทธิ์ขยายเวลา</div>' : '') + '</td><td>' + esc(e.cause) + '</td><td class="num">' + num(e.days_claimed) + '</td><td>' + esc(e.letter_ref) + '</td>' +
+      '<td>' + badge({ k: ok ? 'ok' : e.status === 'ไม่อนุมัติ' ? 'bad' : 'warn', t: e.status }) + '</td><td class="num">' + (e.days_approved !== '' && e.days_approved != null ? num(e.days_approved) : '-') + '</td><td class="noprint"><button class="btn sm sec" data-eot="' + e.id + '">แก้ไข</button></td></tr>'; });
+  return h + '</tbody></table></div></div>';
+}
+function taskOpts(cur) { return opts(wbsList().map(function (o) { return [o.t.id, o.wbs + ' ' + o.t.desc]; }), cur, '- ไม่ระบุ -'); }
+function delRecBtn(store, list, id, label) {
+  return function (bg) { var b = bg.querySelector('#recDel'); if (!b) return;
+    b.onclick = async function () { if (!(await confirmBox('ลบ' + label + 'นี้?', 'ลบ'))) return;
+      await DB.del(store, id); S[list] = S[list].filter(function (x) { return x.id !== id; }); bg.remove(); toast('ลบแล้ว'); render(); }; };
+}
+async function saveRec(store, list, o) { o.projectId = S.P.id; o.updated = new Date().toISOString(); await DB.put(store, o); var i = S[list].findIndex(function (x) { return x.id === o.id; }); if (i >= 0) S[list][i] = o; else S[list].push(o); toast('บันทึกแล้ว'); render(); }
+function openInst(id) {
+  var i = id ? S.installments.filter(function (x) { return x.id === id; })[0] : { no: String(S.installments.length + 1) }, F = fin(), k = F.k, it = i.it || [];
+  var kHtml = F.kUse ? '<div class="sec-h">ดัชนีราคาเดือนส่งมอบงาน (It) สำหรับค่า K</div><div class="grid3">' + [0, 1, 2, 3, 4].filter(function (x) { return num(k.c[x]) > 0; }).map(function (x) {
+    return inp('it' + x, esc(k.n[x] || ('ดัชนี ' + (x + 1))) + ' (ฐาน ' + num(k.io[x]) + ')', it[x] == null ? '' : it[x], '', 'inputmode="decimal"'); }).join('') + '</div>' : '';
+  var bg = modal('<h2>' + (id ? 'งวดที่ ' + esc(i.no) : 'เพิ่มงวดงาน') + '</h2><div class="grid3">' + inp('iNo', 'งวดที่', i.no) + inp('iDue', 'กำหนดแล้วเสร็จ', i.due, 'date') + inp('iReq', 'ผลงานสะสมที่กำหนด (%)', i.req_pct, '', 'inputmode="decimal"') + '</div>' +
+    '<label class="f" for="iScope">เนื้องานที่ต้องแล้วเสร็จในงวด</label><textarea id="iScope" class="i" rows="2">' + esc(i.scope) + '</textarea><div class="grid3">' +
+    inp('iAmt', 'จำนวนเงินตามสัญญา (บาท)', i.amount, '', 'inputmode="decimal"') + inp('iVo', 'งานเพิ่ม-ลดที่รวมในงวด (บาท)', i.vo_amount, '', 'inputmode="decimal"') + inp('iLd', 'หักค่าปรับในงวด (บาท)', i.ld, '', 'inputmode="decimal"') +
+    inp('iSub', 'วันที่ผู้รับจ้างส่งมอบงาน', i.submitted, 'date') + inp('iAcc', 'วันที่คณะกรรมการตรวจรับ', i.accepted, 'date') + '</div>' + kHtml +
+    '<label class="f" for="iRm">หมายเหตุ</label><textarea id="iRm" class="i" rows="2">' + esc(i.remark) + '</textarea>' + (id ? '<div style="margin-top:10px"><button class="btn sm bad" id="recDel">ลบงวดนี้</button></div>' : ''),
+    async function (bg) {
+      var o = Object.assign({}, i, { id: id || uid(), no: val(bg, 'iNo'), due: val(bg, 'iDue'), scope: val(bg, 'iScope'), amount: val(bg, 'iAmt').replace(/,/g, ''), vo_amount: val(bg, 'iVo').replace(/,/g, ''),
+        req_pct: val(bg, 'iReq').replace('%', ''), ld: val(bg, 'iLd').replace(/,/g, ''), submitted: val(bg, 'iSub'), accepted: val(bg, 'iAcc'), remark: val(bg, 'iRm') });
+      if (!o.no || !o.scope || !o.due || !o.amount) throw new Error('กรอกงวดที่ เนื้องาน กำหนดเสร็จ และจำนวนเงิน');
+      if (o.accepted && o.submitted && o.accepted < o.submitted) throw new Error('วันตรวจรับต้องไม่ก่อนวันส่งมอบ');
+      if (F.kUse) o.it = [0, 1, 2, 3, 4].map(function (x) { var e = bg.querySelector('#it' + x); return e && e.value.trim() !== '' ? num(e.value) : (it[x] == null ? null : it[x]); });
+      await saveRec('installments', 'installments', o);
+    }, null, true);
+  delRecBtn('installments', 'installments', id, 'งวดงาน')(bg);
+}
+function openVO(id) {
+  var v = id ? S.vos.filter(function (x) { return x.id === id; })[0] : { type: 'งานเพิ่ม', date: iso(today()), status: 'รอพิจารณา' };
+  var bg = modal('<h2>' + (id ? 'งานเพิ่ม-ลด ' + esc(v.doc_no) : 'บันทึกงานเพิ่ม-ลด') + '</h2><div class="grid3">' + inp('vDoc', 'เลขที่ VO / หนังสือ', v.doc_no) + inp('vDate', 'วันที่', v.date, 'date') +
+    '<div><label class="f" for="vType">ประเภท</label><select id="vType" class="i">' + opts(['งานเพิ่ม', 'งานลด'], v.type) + '</select></div></div>' +
+    '<label class="f" for="vDesc">รายละเอียดงานที่เปลี่ยนแปลง</label><textarea id="vDesc" class="i" rows="2">' + esc(v.desc) + '</textarea>' +
+    '<div class="grid3">' + inp('vAmt', 'จำนวนเงินที่เสนอ (บาท)', v.amount, '', 'inputmode="decimal"') + inp('vDays', 'ผลต่อระยะเวลา (วัน)', v.days, '', 'inputmode="numeric"') +
+    '<div><label class="f" for="vTask">รายการงานที่เกี่ยวข้อง</label><select id="vTask" class="i">' + taskOpts(v.taskId) + '</select></div></div>' +
+    '<div class="sec-h">ผลพิจารณา</div><div class="grid3"><div><label class="f" for="vSt">ผลพิจารณา</label><select id="vSt" class="i">' + opts(VO_ST, v.status) + '</select></div>' +
+    inp('vApAmt', 'จำนวนเงินที่อนุมัติ (บาท)', v.approved_amount, '', 'inputmode="decimal"') + inp('vApDate', 'วันที่อนุมัติ', v.approved_date, 'date') + '</div>' +
+    '<label class="f" for="vRm">หมายเหตุ</label><textarea id="vRm" class="i" rows="2">' + esc(v.remark) + '</textarea>' + (id ? '<div style="margin-top:10px"><button class="btn sm bad" id="recDel">ลบ</button></div>' : ''),
+    async function (bg) {
+      var o = Object.assign({}, v, { id: id || uid(), doc_no: val(bg, 'vDoc'), date: val(bg, 'vDate'), type: val(bg, 'vType'), amount: val(bg, 'vAmt').replace(/,/g, ''), desc: val(bg, 'vDesc'), taskId: val(bg, 'vTask'),
+        days: val(bg, 'vDays'), status: val(bg, 'vSt'), approved_amount: val(bg, 'vApAmt').replace(/,/g, ''), approved_date: val(bg, 'vApDate'), remark: val(bg, 'vRm') });
+      if (!o.desc || !o.amount) throw new Error('กรอกรายละเอียดและจำนวนเงิน');
+      if (o.status === 'อนุมัติ') { if (o.approved_amount === '') o.approved_amount = o.amount; if (!o.approved_date) o.approved_date = iso(today()); }
+      await saveRec('vos', 'vos', o);
+    }, null, true);
+  delRecBtn('vos', 'vos', id, 'รายการ')(bg);
+}
+function openEOT(id) {
+  var e = id ? S.eots.filter(function (x) { return x.id === id; })[0] : { date: iso(today()), cause: 'เหตุสุดวิสัย', status: 'รอพิจารณา' };
+  var bg = modal('<h2>' + (id ? 'เหตุการณ์ล่าช้า' : 'บันทึกเหตุการณ์ล่าช้า / ขอขยายเวลา') + '</h2><div class="grid3">' + inp('eDate', 'วันที่เกิดเหตุ', e.date, 'date') +
+    '<div><label class="f" for="eCause">สาเหตุจาก</label><select id="eCause" class="i">' + opts(EOT_CAUSE, e.cause) + '</select></div>' +
+    '<div><label class="f" for="eTask">รายการงานที่ได้รับผลกระทบ</label><select id="eTask" class="i">' + taskOpts(e.taskId) + '</select></div></div>' +
+    '<label class="f" for="eDesc">รายละเอียดเหตุการณ์</label><textarea id="eDesc" class="i" rows="2">' + esc(e.desc) + '</textarea>' +
+    '<div class="grid3">' + inp('eClaim', 'จำนวนวันที่ขอขยาย', e.days_claimed, '', 'inputmode="numeric"') + inp('eRef', 'เลขที่หนังสือ', e.letter_ref) + inp('eSub', 'วันที่ยื่น', e.submitted, 'date') + '</div>' +
+    '<div class="sec-h">ผลพิจารณา</div><div class="grid3"><div><label class="f" for="eSt">ผลพิจารณา</label><select id="eSt" class="i">' + opts(EOT_ST, e.status) + '</select></div>' +
+    inp('eAp', 'จำนวนวันที่อนุมัติ', e.days_approved, '', 'inputmode="numeric"') + '</div>' +
+    '<label class="f" for="eRm">หมายเหตุ</label><textarea id="eRm" class="i" rows="2">' + esc(e.remark) + '</textarea>' +
+    '<p class="muted">เหตุที่ผู้รับจ้างต้องรับผิดชอบเองไม่มีสิทธิ์ขยายเวลา • ควรยื่นหนังสือภายในระยะเวลาที่สัญญากำหนด</p>' + (id ? '<div style="margin-top:6px"><button class="btn sm bad" id="recDel">ลบ</button></div>' : ''),
+    async function (bg) {
+      var o = Object.assign({}, e, { id: id || uid(), date: val(bg, 'eDate'), cause: val(bg, 'eCause'), desc: val(bg, 'eDesc'), taskId: val(bg, 'eTask'), days_claimed: val(bg, 'eClaim'),
+        letter_ref: val(bg, 'eRef'), submitted: val(bg, 'eSub'), status: val(bg, 'eSt'), days_approved: val(bg, 'eAp'), remark: val(bg, 'eRm') });
+      if (!o.desc || !o.days_claimed) throw new Error('กรอกรายละเอียดและจำนวนวันที่ขอ');
+      if (o.status === 'อนุมัติ' && o.days_approved === '') o.days_approved = o.days_claimed;
+      if (o.status === 'ไม่อนุมัติ') o.days_approved = '0';
+      if (num(o.days_approved) > num(o.days_claimed)) throw new Error('วันที่อนุมัติมากกว่าวันที่ขอ');
+      if (o.cause === 'ผู้รับจ้าง' && (o.status === 'อนุมัติ' || o.status === 'อนุมัติบางส่วน') && !(await confirmBox('เหตุจากผู้รับจ้างโดยปกติไม่มีสิทธิ์ขยายเวลา ยืนยันอนุมัติ?', 'ยืนยัน'))) return false;
+      await saveRec('eots', 'eots', o);
+    }, null, true);
+  delRecBtn('eots', 'eots', id, 'รายการ')(bg);
+}
+function openFinSet() {
+  var F = fin(), k = F.k;
+  modal('<h2>เงื่อนไขสัญญา</h2><div class="grid3">' + inp('fAdv', 'เงินล่วงหน้า (% ของสัญญา)', F.adv, '', 'inputmode="decimal"') + inp('fRet', 'หักเงินประกันผลงาน (% ต่องวด)', F.ret, '', 'inputmode="decimal"') + '<div></div>' +
+    inp('fLdr', 'อัตราค่าปรับ (% ของสัญญาต่อวัน)', F.ldRate, '', 'inputmode="decimal"') + inp('fLdm', 'ค่าปรับขั้นต่ำต่อวัน (บาท)', F.ldMin, '', 'inputmode="decimal"') + inp('fCap', 'เกณฑ์เตือนค่าปรับสะสม (% ของสัญญา)', F.ldCap, '', 'inputmode="decimal"') + '</div>' +
+    '<div class="sec-h">ค่า K (สัญญาแบบปรับราคาได้)</div><div class="grid3"><div><label class="f" for="fKu">ใช้ค่า K</label><select id="fKu" class="i">' + opts([['0', 'ไม่ใช้'], ['1', 'ใช้']], F.kUse ? '1' : '0') + '</select></div>' +
+    inp('fKt', 'คิดเฉพาะส่วนที่เกิน ± (%)', F.kThr, '', 'inputmode="decimal"') + inp('fKa', 'ค่าคงที่ a', k.a, '', 'inputmode="decimal"') + '</div>' +
+    '<div class="tw"><table class="tbl"><thead><tr><th>ชื่อดัชนี</th><th>สัมประสิทธิ์</th><th>ดัชนีฐาน Io (เดือนเปิดซอง)</th></tr></thead><tbody>' + [0, 1, 2, 3, 4].map(function (x) {
+      return '<tr><td><input class="i" id="kn' + x + '" value="' + esc(k.n[x]) + '" aria-label="ชื่อดัชนี ' + (x + 1) + '"></td><td><input class="i" id="kc' + x + '" value="' + esc(k.c[x]) + '" inputmode="decimal" aria-label="สัมประสิทธิ์ ' + (x + 1) + '"></td><td><input class="i" id="ki' + x + '" value="' + esc(k.io[x]) + '" inputmode="decimal" aria-label="ดัชนีฐาน ' + (x + 1) + '"></td></tr>'; }).join('') + '</tbody></table></div>' +
+    '<p class="muted">ตัวอย่างสูตรงานอาคาร K = 0.25 + 0.15 It/Io + 0.10 Ct/Co + 0.40 Mt/Mo + 0.10 St/So • ต้องใช้สูตรตามที่ระบุในสัญญา • a + สัมประสิทธิ์รวมต้องเท่ากับ 1</p>',
+    async function (bg) {
+      var nk = { a: num(val(bg, 'fKa')), c: [], io: [], n: [] };
+      for (var x = 0; x < 5; x++) { nk.n.push(val(bg, 'kn' + x)); nk.c.push(num(val(bg, 'kc' + x))); nk.io.push(num(val(bg, 'ki' + x))); }
+      var use = val(bg, 'fKu') === '1', sum = nk.a + nk.c.reduce(function (a, b) { return a + b; }, 0);
+      if (use && Math.abs(sum - 1) > 0.0001) throw new Error('ผลรวม a + สัมประสิทธิ์ = ' + sum.toFixed(2) + ' (ต้องเท่ากับ 1)');
+      if (use && nk.c.some(function (c, i) { return c > 0 && !nk.io[i]; })) throw new Error('ดัชนีที่มีสัมประสิทธิ์ต้องมีค่าฐาน Io');
+      S.P.fin = { adv: num(val(bg, 'fAdv')), ret: num(val(bg, 'fRet')), ldRate: num(val(bg, 'fLdr')), ldMin: num(val(bg, 'fLdm')), ldCap: num(val(bg, 'fCap')), kUse: use, kThr: num(val(bg, 'fKt')), k: nk };
+      await saveProject(); toast('บันทึกเงื่อนไขสัญญาแล้ว'); render();
+    }, null, true);
+}
+function docPay(id) {
+  var i = S.installments.filter(function (x) { return x.id === id; })[0]; if (!i) return '<div class="card empty">ไม่พบงวดงาน</div>';
+  var p = S.P, pay = payOf(i), F = fin(), row = function (a, b, strong) { return '<tr><td>' + a + '</td><td class="num">' + (strong ? '<b>' + b + '</b>' : b) + '</td></tr>'; };
+  return '<div class="doc"><h1>ใบสรุปการคำนวณเงินค่างาน งวดที่ ' + esc(i.no) + '</h1><p style="text-align:center;margin-top:-4px">' + esc(p.org || '') + '</p>' + docHead() +
+    '<table><tr><td style="width:24%">เนื้องานของงวด</td><td colspan="3">' + esc(i.scope) + '</td></tr><tr><td>กำหนดแล้วเสร็จ</td><td>' + th(i.due) + '</td><td style="width:18%">สถานะ</td><td>' + esc(instStatus(i).t) + '</td></tr>' +
+    '<tr><td>วันที่ส่งมอบงาน</td><td>' + th(i.submitted) + '</td><td>วันที่ตรวจรับ</td><td>' + th(i.accepted) + '</td></tr></table>' +
+    '<h3>การคำนวณ</h3><table>' + row('ค่างานตามสัญญา', money(i.amount)) + (num(i.vo_amount) ? row('งานเพิ่ม-ลดที่รวมในงวด', money(i.vo_amount)) : '') + row('มูลค่างานงวดนี้', money(pay.amt), true) +
+    (pay.K != null ? row('ค่า K = ' + pay.K.toFixed(4) + ' (คิดเฉพาะส่วนที่เกิน ±' + F.kThr + '%)', money(pay.kadj)) : '') +
+    row('หัก เงินล่วงหน้า ' + F.adv + '%', '(' + money(pay.adv) + ')') + row('หัก เงินประกันผลงาน ' + F.ret + '%', '(' + money(pay.ret) + ')') + (pay.ld ? row('หัก ค่าปรับ', '(' + money(pay.ld) + ')') : '') +
+    row('ยอดจ่ายสุทธิ (ก่อนภาษี)', money(pay.net), true) + '</table>' + (i.remark ? '<h3>หมายเหตุ</h3><div class="box">' + esc(i.remark) + '</div>' : '') +
+    '<p class="muted" style="font-size:12px">ยอดสุทธิยังไม่รวมภาษีมูลค่าเพิ่มและภาษีหัก ณ ที่จ่าย – ปรับตามเงื่อนไขสัญญาและระเบียบของหน่วยงาน</p>' +
+    '<div class="sig"><div>ลงชื่อ ...........................<br>(...........................)<br>ผู้จัดทำ</div><div>ลงชื่อ ...........................<br>(' + esc(p.supervisor_name || '...........................') + ')<br>' + esc(p.supervisor_pos || 'ผู้ควบคุมงาน') + '</div>' +
+    '<div>ลงชื่อ ...........................<br>(' + esc(p.chair || '...........................') + ')<br>ประธานกรรมการตรวจรับพัสดุ</div></div></div>';
+}
+
+/* ---------------- ส่งออก Excel รูปแบบ v4 (เติมข้อมูลลงไฟล์แม่แบบ รักษาสูตร กราฟ และรูปแบบทั้งหมด) ---------------- */
+var TPL_PATH = { single: 'templates/template_single.xlsx', multi: 'templates/template_multi.xlsx' };
+var X_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main', R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+function loadJSZip() {
+  if (window.JSZip) return Promise.resolve();
+  var tryLoad = function (src) { return new Promise(function (res, rej) { var s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); };
+  return tryLoad('vendor/jszip.min.js').catch(function () { return tryLoad('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js'); }).catch(function () { throw new Error('โหลดตัวสร้างไฟล์ Excel ไม่ได้'); });
+}
+async function tplBuffer(kind) {
+  if (window.TPL_B64 && TPL_B64[kind]) { var bin = atob(TPL_B64[kind]), a = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a.buffer; }
+  var r = await fetch(TPL_PATH[kind]); if (!r.ok) throw new Error('ไม่พบไฟล์แม่แบบ Excel (' + TPL_PATH[kind] + ')'); return r.arrayBuffer();
+}
+function colNum(L) { var n = 0; for (var i = 0; i < L.length; i++) n = n * 26 + L.charCodeAt(i) - 64; return n; }
+function xlDate(dIso) { var d = D(dIso); return d ? (Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) - Date.UTC(1899, 11, 30)) / 86400000 : ''; }
+function XSheet(xml, ss) {
+  this.doc = new DOMParser().parseFromString(xml, 'application/xml'); this.ss = ss;
+  this.sd = this.doc.getElementsByTagNameNS(X_NS, 'sheetData')[0]; this.rows = {}; this.cells = {};
+  var self = this;
+  Array.prototype.forEach.call(this.sd.getElementsByTagNameNS(X_NS, 'row'), function (r) {
+    self.rows[r.getAttribute('r')] = r;
+    Array.prototype.forEach.call(r.getElementsByTagNameNS(X_NS, 'c'), function (c) { self.cells[c.getAttribute('r')] = c; });
+  });
+}
+XSheet.prototype.row = function (n) {
+  if (this.rows[n]) return this.rows[n];
+  var el = this.doc.createElementNS(X_NS, 'row'); el.setAttribute('r', String(n));
+  var next = null; Array.prototype.some.call(this.sd.childNodes, function (x) { if (x.nodeType === 1 && +x.getAttribute('r') > n) { next = x; return true; } return false; });
+  this.sd.insertBefore(el, next); this.rows[n] = el; return el;
+};
+XSheet.prototype.cell = function (ref) {
+  if (this.cells[ref]) return this.cells[ref];
+  var m = /^([A-Z]+)(\d+)$/.exec(ref), row = this.row(+m[2]), cn = colNum(m[1]);
+  var el = this.doc.createElementNS(X_NS, 'c'); el.setAttribute('r', ref);
+  var above = this.cells[m[1] + (+m[2] - 1)]; if (above && above.getAttribute('s')) el.setAttribute('s', above.getAttribute('s'));
+  var next = null; Array.prototype.some.call(row.childNodes, function (x) { if (x.nodeType === 1 && colNum(/^[A-Z]+/.exec(x.getAttribute('r'))[0]) > cn) { next = x; return true; } return false; });
+  row.insertBefore(el, next); this.cells[ref] = el; return el;
+};
+XSheet.prototype.set = function (ref, v) {
+  var c = (v === '' || v == null) ? this.cells[ref] : this.cell(ref); if (!c) return;
+  while (c.firstChild) c.removeChild(c.firstChild); c.removeAttribute('t');
+  if (v === '' || v == null) return;
+  if (typeof v === 'number') { if (!isFinite(v)) return; c.setAttribute('t', 'n'); var ve = this.doc.createElementNS(X_NS, 'v'); ve.textContent = String(v); c.appendChild(ve); return; }
+  c.setAttribute('t', 'inlineStr'); var is = this.doc.createElementNS(X_NS, 'is'), t = this.doc.createElementNS(X_NS, 't');
+  t.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve'); t.textContent = String(v); is.appendChild(t); c.appendChild(is);
+};
+XSheet.prototype.clearCols = function (cols, r1, r2) { for (var r = r1; r <= r2; r++) for (var i = 0; i < cols.length; i++) this.set(cols[i] + r, ''); };
+XSheet.prototype.text = function (ref) {
+  var c = this.cells[ref]; if (!c) return '';
+  var t = c.getAttribute('t'), v = c.getElementsByTagNameNS(X_NS, 'v')[0];
+  if (t === 's' && v) return this.ss[+v.textContent] || '';
+  if (t === 'inlineStr') return c.textContent; return v ? v.textContent : '';
+};
+XSheet.prototype.stripCache = function () {
+  Array.prototype.forEach.call(this.doc.getElementsByTagNameNS(X_NS, 'c'), function (c) {
+    if (!c.getElementsByTagNameNS(X_NS, 'f').length) return;
+    Array.prototype.slice.call(c.getElementsByTagNameNS(X_NS, 'v')).forEach(function (v) { c.removeChild(v); });
+    c.removeAttribute('t');
+  });
+};
+XSheet.prototype.xml = function () { return new XMLSerializer().serializeToString(this.doc); };
+
+// รหัส WBS แบบเดียวกับสูตรในไฟล์ Excel (ใช้ผูกรายการใน VO/EOT/วัสดุ)
+function tplCodes(multi) {
+  var P = parts(), C = cats(), seq = {}, m = {};
+  wbsList().forEach(function (o) { var t = o.t, pi = P.indexOf(t.part) + 1, ci = C.indexOf(t.cat) + 1, k = pi + '.' + ci; seq[k] = (seq[k] || 0) + 1;
+    m[t.id] = multi ? pi + '.' + ci + '.' + (seq[k] < 10 ? '0' : '') + seq[k] : ci + '.' + seq[k]; });
+  return m;
+}
+function tplPeriods(multi) {
+  var st = projStart(), all = S.tasks, minOf = function (k) { return all.map(function (t) { return t[k]; }).filter(Boolean).sort()[0]; };
+  var ax = [iso(st), minOf('bs'), minOf('rs'), minOf('as')].filter(Boolean).sort()[0];
+  var snap = function (d) { var x = d.getDate(); return x <= 10 ? new Date(d.getFullYear(), d.getMonth(), 10) : x <= 20 ? new Date(d.getFullYear(), d.getMonth(), 20) : new Date(d.getFullYear(), d.getMonth() + 1, 0); };
+  var out = [], s = D(ax);
+  for (var i = 0; i < 80; i++) { var e = snap(s); out.push({ s: s, e: e }); s = addDays(e, 1); }
+  return out;
+}
+async function exportV4() {
+  await loadJSZip();
+  var multi = isMulti() || parts().length > 1 || S.tasks.length > 60, kind = multi ? 'multi' : 'single';
+  var cap = multi ? 150 : 60;
+  if (S.tasks.length > cap) throw new Error('รายการงานเกิน ' + cap + ' รายการ ซึ่งเป็นความจุของแม่แบบ Excel');
+  if (parts().length > 10 || cats().length > 10) throw new Error('แม่แบบ Excel รองรับงานส่วนและหมวดงานไม่เกินอย่างละ 10');
+  var zip = await JSZip.loadAsync(await tplBuffer(kind));
+  var wbXml = await zip.file('xl/workbook.xml').async('string'), relXml = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+  var wbDoc = new DOMParser().parseFromString(wbXml, 'application/xml'), relDoc = new DOMParser().parseFromString(relXml, 'application/xml');
+  var target = {}; Array.prototype.forEach.call(relDoc.getElementsByTagName('Relationship'), function (r) { target[r.getAttribute('Id')] = 'xl/' + r.getAttribute('Target').replace(/^\/?xl\//, ''); });
+  var paths = {}; Array.prototype.forEach.call(wbDoc.getElementsByTagNameNS(X_NS, 'sheet'), function (s) { paths[s.getAttribute('name')] = target[s.getAttributeNS(R_NS, 'id')]; });
+  var ss = [], ssf = zip.file('xl/sharedStrings.xml');
+  if (ssf) { var sd = new DOMParser().parseFromString(await ssf.async('string'), 'application/xml'); Array.prototype.forEach.call(sd.getElementsByTagNameNS(X_NS, 'si'), function (si) { ss.push(si.textContent); }); }
+  var sheets = {};
+  var sh = async function (name) { if (!sheets[name]) { if (!paths[name]) throw new Error('แม่แบบไม่มีชีต ' + name); sheets[name] = new XSheet(await zip.file(paths[name]).async('string'), ss); } return sheets[name]; };
+  var p = S.P, F = fin(), d = today(), codes = tplCodes(multi), stamp = 'ส่งออกจากแอปคุมงานก่อสร้าง เมื่อ ' + th(d) + ' ' + new Date().toTimeString().slice(0, 5) + ' น.';
+  var pctF = function (v) { return v === '' || v == null ? '' : num(v) / 100; }, n0 = function (v) { return v === '' || v == null ? '' : num(v); }, dt = function (v) { return v ? xlDate(v) : ''; };
+  // ---- ตั้งค่า
+  var su = await sh('ตั้งค่า Setup');
+  su.set('B2', 'กรอกเฉพาะช่องสีเหลือง • ' + stamp);
+  [['C4', p.name], ['C5', ''], ['C6', p.employer], ['C7', p.contractor], ['C8', p.contract_no], ['C9', n0(p.bac)], ['C10', dt(p.start)], ['C11', n0(p.duration)],
+    ['C15', xlDate(iso(d))], ['C17', F.ldRate / 100], ['C18', F.ldMin], ['C19', F.ldCap / 100], ['C22', p.supervisor_name || '']].forEach(function (x) { su.set(x[0], x[1]); });
+  for (var r = 4; r <= 22; r++) if (/ตัวอย่าง|จากเอกสาร|อ่านจาก|EXAMPLE/.test(su.text('D' + r))) su.set('D' + r, '');
+  if (multi) { su.clearCols(['C'], 26, 35); su.clearCols(['C'], 38, 47); parts().forEach(function (x, i) { su.set('C' + (26 + i), x); }); cats().forEach(function (x, i) { su.set('C' + (38 + i), x); }); }
+  else { su.clearCols(['C'], 26, 35); cats().forEach(function (x, i) { su.set('C' + (26 + i), x); }); }
+  // ---- แผนงาน
+  var sc = await sh('แผนงาน Schedule'), RN = multi ? 156 : 66;
+  var M = multi ? { part: 'B', cat: 'C', desc: 'D', boq: 'E', w: 'F', bs: 'I', bf: 'J', rs: 'L', rf: 'M', as: 'N', af: 'O', pct: 'P', rm: 'Z' }
+    : { cat: 'B', desc: 'C', boq: 'D', w: 'E', bs: 'H', bf: 'I', rs: 'K', rf: 'L', as: 'M', af: 'N', pct: 'O', rm: 'Y' };
+  sc.clearCols(Object.keys(M).map(function (k) { return M[k]; }), 7, RN);
+  wbsList().forEach(function (o, i) { var t = o.t, r = 7 + i;
+    if (multi) sc.set(M.part + r, t.part); sc.set(M.cat + r, t.cat); sc.set(M.desc + r, t.desc); sc.set(M.boq + r, n0(t.boq)); sc.set(M.w + r, pctF(t.weight));
+    ['bs', 'bf', 'rs', 'rf', 'as', 'af'].forEach(function (k) { sc.set(M[k] + r, dt(t[k])); });
+    sc.set(M.pct + r, num(t.pct) / 100); sc.set(M.rm + r, t.remark || ''); });
+  // ---- S-Curve (ค่าสะสมจริงรายงวดจากประวัติผลงาน + เงินเบิกจ่าย)
+  var cv = await sh('S-Curve'), hist = histIndex(), per = tplPeriods(multi);
+  cv.clearCols(['F', 'K', 'M'], 7, 86);
+  per.forEach(function (x, i) {
+    if (x.s > d) return; var r = 7 + i;
+    cv.set('F' + r, actualAt(x.e <= d ? x.e : d, hist));
+    var paid = S.installments.filter(function (it) { return it.accepted && it.accepted >= iso(x.s) && it.accepted <= iso(x.e); }).reduce(function (a, it) { return a + payOf(it).net; }, 0);
+    if (paid) cv.set('M' + r, paid);
+  });
+  // ---- ขยายเวลา
+  var eo = await sh('ขยายเวลา EOT'), CAUSE = { 'ผู้ว่าจ้าง': 'ผู้ว่าจ้าง / Employer', 'ผู้รับจ้าง': 'ผู้รับจ้าง / Contractor', 'เหตุสุดวิสัย': 'เหตุสุดวิสัย / Force Majeure', 'อื่นๆ': 'อื่นๆ / Other' };
+  var EST = { 'รอพิจารณา': 'รอพิจารณา / Pending', 'อนุมัติ': 'อนุมัติ / Approved', 'อนุมัติบางส่วน': 'อนุมัติบางส่วน / Partial', 'ไม่อนุมัติ': 'ไม่อนุมัติ / Rejected' };
+  eo.clearCols(['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'L'], 8, 57);
+  var eList = S.eots.slice().sort(function (a, b) { return (a.date || '') < (b.date || '') ? -1 : 1; });
+  if (num(p.eot_days)) eList.push({ date: '', desc: 'ขยายเวลาอื่น (นอกทะเบียน)', cause: 'อื่นๆ', days_claimed: p.eot_days, status: 'อนุมัติ', days_approved: p.eot_days });
+  eList.slice(0, 50).forEach(function (e, i) { var r = 8 + i;
+    eo.set('B' + r, dt(e.date)); eo.set('C' + r, e.desc); eo.set('D' + r, codes[e.taskId] || ''); eo.set('E' + r, CAUSE[e.cause] || ''); eo.set('F' + r, n0(e.days_claimed));
+    eo.set('G' + r, e.letter_ref || ''); eo.set('H' + r, dt(e.submitted)); eo.set('I' + r, EST[e.status] || ''); eo.set('J' + r, n0(e.days_approved)); eo.set('L' + r, e.remark || ''); });
+  // ---- บันทึกสัปดาห์
+  var wl = await sh('บันทึกสัปดาห์ Weekly Log');
+  [['C4', p.org], ['C5', p.doc_prefix], ['C6', dt(p.contract_date)], ['C7', p.supervisor_name], ['C8', p.supervisor_pos || 'ผู้ควบคุมงาน'], ['C9', p.chair], ['C10', p.member1], ['C11', p.member2]].forEach(function (x) { wl.set(x[0], x[1] || ''); });
+  wl.clearCols(['E', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O'], 17, 120);
+  for (var n = 1; n <= Math.min(104, weekOf(d)); n++) {
+    var st = weekStats(n), w = weekRec(n) || {}, r = 16 + n;
+    if (st.r.start > d) break;
+    wl.set('E' + r, st.act);
+    if (st.days.length) { wl.set('H' + r, Math.round(st.menAvg * 10) / 10); wl.set('I' + r, Object.keys(st.mach).map(function (k) { return k + ' ' + st.mach[k]; }).join(', ')); wl.set('J' + r, st.work + ' / ' + (st.days.length - st.work)); }
+    var wd = w.work_done != null ? w.work_done : compileText(st, 'work'); if (wd) wl.set('K' + r, wd);
+    if (w.next_plan) wl.set('L' + r, w.next_plan);
+    var mt = w.materials != null ? w.materials : compileText(st, 'materials'); if (mt) wl.set('M' + r, mt);
+    var is = w.issues != null ? w.issues : compileText(st, 'issues'); if (is) wl.set('N' + r, is);
+    if (w.opinion) wl.set('O' + r, w.opinion);
+  }
+  // ---- งวดงาน + เงินงวด
+  var ins = await sh('งวดงาน Installments'), pay = await sh('เงินงวด Payment'), list = sortedInst().slice(0, 20);
+  ins.set('A3', stamp);
+  ins.clearCols(['A', 'B', 'C', 'D', 'E', 'G', 'H', 'M'], 7, 26); pay.clearCols(['D', 'F', 'G', 'H', 'I', 'J', 'O'], 15, 34);
+  list.forEach(function (i, k) { var r = 7 + k, q = 15 + k;
+    ins.set('A' + r, /^\d+$/.test(String(i.no)) ? +i.no : i.no); ins.set('B' + r, i.scope); ins.set('C' + r, pctF(i.req_pct)); ins.set('D' + r, dt(i.due)); ins.set('E' + r, n0(i.amount));
+    ins.set('G' + r, dt(i.submitted)); ins.set('H' + r, dt(i.accepted)); ins.set('M' + r, i.remark || '');
+    pay.set('D' + q, n0(i.vo_amount)); (i.it || []).forEach(function (v, j) { if (v != null && v !== '') pay.set(String.fromCharCode(70 + j) + q, num(v)); }); pay.set('O' + q, n0(i.ld)); });
+  pay.set('D5', F.adv / 100); pay.set('D7', F.ret / 100); pay.set('D8', F.kThr / 100); pay.set('D9', F.kUse ? 'ใช้' : 'ไม่ใช้'); pay.set('H4', num(F.k.a));
+  for (var j = 0; j < 5; j++) { pay.set('H' + (5 + j), num(F.k.c[j])); pay.set('I' + (5 + j), num(F.k.io[j]) || ''); pay.set('J' + (5 + j), F.k.n[j] || ''); }
+  // ---- งานเพิ่มลด
+  var vo = await sh('งานเพิ่มลด VO');
+  vo.clearCols(['B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'M'], 10, 59);
+  S.vos.slice().sort(function (a, b) { return (a.date || '') < (b.date || '') ? -1 : 1; }).slice(0, 50).forEach(function (v, i) { var r = 10 + i;
+    vo.set('B' + r, v.doc_no || ''); vo.set('C' + r, dt(v.date)); vo.set('D' + r, v.desc); vo.set('E' + r, codes[v.taskId] || ''); vo.set('F' + r, v.type); vo.set('G' + r, n0(v.amount));
+    vo.set('H' + r, v.status); vo.set('I' + r, v.status === 'อนุมัติ' ? n0(v.approved_amount !== '' && v.approved_amount != null ? v.approved_amount : v.amount) : ''); vo.set('J' + r, dt(v.approved_date)); vo.set('K' + r, n0(v.days)); vo.set('M' + r, v.remark || ''); });
+  // ---- ขออนุมัติวัสดุ
+  var sb = await sh('ขออนุมัติวัสดุ Submittal'), AIR = { approved: 'ผ่าน', more_docs: 'ขอเอกสารเพิ่มเติม', rejected: 'ไม่ผ่าน' };
+  sb.clearCols(['B', 'C', 'D', 'E', 'F', 'H', 'J', 'K', 'L', 'M', 'O'], 9, 108);
+  S.submittals.slice().sort(function (a, b) { return (a.doc_no || '').localeCompare(b.doc_no || '', 'th'); }).slice(0, 100).forEach(function (s, i) { var r = 9 + i, cs = checkSummary(s);
+    sb.set('B' + r, s.doc_no); sb.set('C' + r, s.spec_sec ? specName(s.spec_sec) : 'ข้อกำหนดเฉพาะ'); sb.set('D' + r, s.material); sb.set('E' + r, s.brand || ''); sb.set('F' + r, codes[s.taskId] || '');
+    sb.set('H' + r, n0(s.lead_days)); sb.set('J' + r, dt(s.submitted_date)); sb.set('K' + r, s.status); sb.set('L' + r, dt(s.approved_date));
+    sb.set('M' + r, s.ai ? AIR[s.ai.overall] : 'ยังไม่ตรวจ'); sb.set('O' + r, [s.remark, cs.n ? 'ตรวจแล้ว ' + cs.done + '/' + cs.n + ' ข้อ' : ''].filter(Boolean).join(' • ')); });
+  // ---- คู่มือ: แทนข้อความ "ข้อมูลตัวอย่าง"
+  var gu = await sh('คู่มือ Guide');
+  Object.keys(gu.cells).forEach(function (ref) { if (/ข้อมูลตัวอย่าง|EXAMPLE/.test(gu.text(ref))) gu.set(ref, '⚠ ' + stamp + ' – ข้อมูลเป็นของโครงการ ' + p.name); });
+  // ---- ล้างค่าสูตรเดิม (ให้ Excel คำนวณใหม่เมื่อเปิด) และลบความคิดเห็นตัวอย่าง
+  var ct = await zip.file('[Content_Types].xml').async('string');
+  for (var name in paths) {
+    var path = paths[name], s = sheets[name] || new XSheet(await zip.file(path).async('string'), ss);
+    s.stripCache();
+    var relPath = path.replace(/worksheets\/([^\/]+)$/, 'worksheets/_rels/$1.rels'), rf = zip.file(relPath);
+    if (rf) {
+      var rd = new DOMParser().parseFromString(await rf.async('string'), 'application/xml'), drop = [];
+      Array.prototype.forEach.call(rd.getElementsByTagName('Relationship'), function (rel) { if (/\/(comments|vmlDrawing)$/.test(rel.getAttribute('Type'))) drop.push(rel); });
+      drop.forEach(function (rel) {
+        var tp = 'xl/' + rel.getAttribute('Target').replace(/^\.\.\//, ''); zip.remove(tp);
+        ct = ct.replace(new RegExp('<Override[^>]*PartName="/' + tp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '"[^>]*/>'), '');
+        rel.parentNode.removeChild(rel);
+      });
+      if (drop.length) { Array.prototype.slice.call(s.doc.getElementsByTagNameNS(X_NS, 'legacyDrawing')).forEach(function (x) { x.parentNode.removeChild(x); }); zip.file(relPath, new XMLSerializer().serializeToString(rd)); }
+    }
+    zip.file(path, s.xml());
+  }
+  zip.file('[Content_Types].xml', ct);
+  var calc = wbDoc.getElementsByTagNameNS(X_NS, 'calcPr')[0];
+  if (!calc) { calc = wbDoc.createElementNS(X_NS, 'calcPr'); wbDoc.documentElement.appendChild(calc); }
+  calc.setAttribute('fullCalcOnLoad', '1'); zip.file('xl/workbook.xml', new XMLSerializer().serializeToString(wbDoc));
+  if (zip.file('xl/calcChain.xml')) zip.remove('xl/calcChain.xml');
+  var blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', compression: 'DEFLATE' });
+  var fname = 'ควบคุมงาน_' + p.name.replace(/[\\\/:*?"<>|()]/g, '_').slice(0, 50) + '_' + iso(d) + '.xlsx';
+  if (await saveBlob(fname, blob)) toast('ส่งออกไฟล์ Excel (รูปแบบ v4 ' + (multi ? 'หลายงานส่วน' : 'งานเดียว') + ') แล้ว', false, 4000);
+}
+
+/* ---------------- AI ตรวจสเปก (Claude API เรียกจากเครื่องโดยตรง) ---------------- */
+var AI_DEFAULT_MODEL = 'claude-sonnet-5';
+var AI_URL = 'https://api.anthropic.com/v1';
+async function aiCfg() { return Object.assign({ key: '', model: AI_DEFAULT_MODEL, limit: 30, used: {} }, (await meta('ai')) || {}); }
+function aiSandboxed() { return /claudeusercontent|claude\.ai|claude\.site/.test(location.host) || location.protocol === 'file:'; }
+function aiHeaders(key) { return { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true', 'content-type': 'application/json' }; }
+async function aiTest(key, model) {
+  var r = await fetch(AI_URL + '/models?limit=1000', { headers: aiHeaders(key) }).catch(function () { throw new Error('เชื่อมต่อไม่ได้ – ตรวจอินเทอร์เน็ต'); });
+  if (r.status === 401) throw new Error('API key ไม่ถูกต้องหรือถูกยกเลิก');
+  if (!r.ok) throw new Error('เชื่อมต่อไม่ได้ (' + r.status + ')');
+  var ids = ((await r.json()).data || []).map(function (m) { return m.id; });
+  if (ids.length && ids.indexOf(model) < 0) throw new Error('คีย์ใช้ได้ แต่ไม่พบโมเดล ' + model + ' – ใช้ได้: ' + ids.slice(0, 5).join(', '));
+  return 'เชื่อมต่อสำเร็จ • โมเดล ' + model;
+}
+var AI_SYSTEM = [
+  'คุณคือผู้ตรวจสอบวัสดุก่อสร้างของผู้ควบคุมงานในโครงการภาครัฐของไทย',
+  'หน้าที่: เทียบเอกสารสเปก/แคตตาล็อก/ใบรับรอง/ภาพถ่ายวัสดุที่ผู้รับจ้างเสนอ กับ "ข้อกำหนด" ที่ให้มาทีละข้อ',
+  'กฎที่ต้องปฏิบัติอย่างเคร่งครัด:',
+  '1. ใช้เฉพาะสิ่งที่เห็นจริงในไฟล์ที่แนบ ห้ามเดา ห้ามใช้ความรู้ทั่วไปแทนหลักฐาน',
+  '2. ถ้าไม่พบหลักฐานของข้อใด ให้ตัดสิน "ไม่พบข้อมูล" และระบุว่าต้องขอเอกสารอะไรเพิ่ม',
+  '3. ตัดสิน "ไม่ผ่าน" เฉพาะเมื่อพบหลักฐานที่ขัดกับข้อกำหนดชัดเจน',
+  '4. ถ้าข้อกำหนดไม่เกี่ยวกับวัสดุที่เสนอ (เช่น วัสดุคนละชนิดในหมวดเดียวกัน หรือขั้นตอนทำงานหน้างาน) ให้ตัดสิน "ไม่เกี่ยวข้อง"',
+  '5. ช่อง found ให้สั้น ไม่เกิน 30 คำ ระบุสิ่งที่พบและตำแหน่ง เช่น "ไฟล์ 2 หน้า 1: มอก. 24-2559 SD40"',
+  '6. ตอบเป็น JSON เท่านั้น ไม่มีข้อความอื่น ไม่มี ``` ครอบ'
+].join('\n');
+function parseAiJson(text) {
+  var t = String(text || '').replace(/```json|```/g, '').trim(), a = t.indexOf('{'), b = t.lastIndexOf('}');
+  if (a < 0 || b <= a) throw new Error('AI ตอบกลับในรูปแบบที่อ่านไม่ได้ กรุณาลองใหม่');
+  try { return JSON.parse(t.slice(a, b + 1)); } catch (e) { throw new Error('AI ตอบกลับในรูปแบบที่อ่านไม่ได้ กรุณาลองใหม่'); }
+}
+async function aiCheck(s) {
+  var cfg = await aiCfg(), day = iso(today()), used = num(cfg.used[day]);
+  if (aiSandboxed()) throw new Error('AI ใช้ได้เมื่อเปิดแอปจาก GitHub Pages (หน้าทดลองใน claude.ai ไม่อนุญาตให้เชื่อมต่อภายนอก)');
+  if (!cfg.key) throw new Error('ยังไม่ได้ใส่ API key – ไปที่ ตั้งค่าแอป → AI ตรวจสเปก');
+  if (used >= num(cfg.limit)) throw new Error('ใช้ AI ครบโควตาวันนี้แล้ว (' + cfg.limit + ' ครั้ง) – ปรับได้ที่ตั้งค่าแอป');
+  var crit = criteriaOf(s).slice(0, 60);
+  if (!crit.length) throw new Error('กำหนดเกณฑ์ตรวจก่อน (เลือกหมวดหรือพิมพ์ข้อกำหนด)');
+  var files = filesOf('submittal', s.id).slice(0, 8);
+  if (!files.length) throw new Error('แนบเอกสารสเปกหรือรูปวัสดุก่อน');
+  var total = files.reduce(function (a, f) { return a + (f.size || f.blob.size); }, 0);
+  if (total > 24 * 1024 * 1024) throw new Error('ไฟล์แนบรวมใหญ่เกิน 24 MB – ลดจำนวนไฟล์หรือแยกเฉพาะหน้าที่เกี่ยวข้อง');
+  var content = [];
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i], src = { type: 'base64', media_type: f.mime, data: await b64FromBlob(f.blob) };
+    content.push({ type: 'text', text: 'ไฟล์ ' + (i + 1) + ': ' + f.name + (f.caption ? ' (' + f.caption + ')' : '') });
+    content.push(f.mime === 'application/pdf' ? { type: 'document', source: src } : { type: 'image', source: src });
+  }
+  content.push({ type: 'text', text: ['วัสดุที่เสนอ: ' + (s.material || '-') + ' | ยี่ห้อ/รุ่น: ' + (s.brand || '-') + ' | หมวด: ' + (s.spec_sec ? specName(s.spec_sec) : 'ข้อกำหนดเฉพาะ'),
+    'ข้อกำหนดที่ต้องตรวจ (JSON): ' + JSON.stringify(crit.map(function (c) { return { cl: c.cl, mat: c.mat, kind: c.kind, req: c.req }; })),
+    'ตอบเป็น JSON รูปแบบ: {"items":[{"cl":"ข้อ","mat":"วัสดุ","found":"สิ่งที่พบ","verdict":"ผ่าน|ไม่ผ่าน|ไม่พบข้อมูล|ไม่เกี่ยวข้อง"}],"summary":"สรุป 2-4 ประโยค ระบุเอกสารที่ต้องขอเพิ่ม (ถ้ามี)"} โดยมี items ครบทุกข้อตามลำดับ'].join('\n') });
+  cfg.used = {}; cfg.used[day] = used + 1; await meta('ai', cfg);
+  var ctl = new AbortController(), timer = setTimeout(function () { ctl.abort(); }, 180000), res;
+  try {
+    res = await fetch(AI_URL + '/messages', { method: 'POST', headers: aiHeaders(cfg.key), signal: ctl.signal,
+      body: JSON.stringify({ model: cfg.model || AI_DEFAULT_MODEL, max_tokens: 4000, system: AI_SYSTEM, messages: [{ role: 'user', content: content }] }) });
+  } catch (e) { throw new Error(e.name === 'AbortError' ? 'AI ใช้เวลานานเกินไป ลองลดจำนวนไฟล์แล้วตรวจใหม่' : 'เชื่อมต่อ AI ไม่ได้ – ตรวจอินเทอร์เน็ต'); } finally { clearTimeout(timer); }
+  var txt = await res.text();
+  if (!res.ok) { var msg = txt; try { msg = JSON.parse(txt).error.message; } catch (e) {} throw new Error('AI ตอบกลับผิดพลาด (' + res.status + '): ' + String(msg).slice(0, 160)); }
+  var data = JSON.parse(txt), out = parseAiJson((data.content || []).filter(function (b) { return b.type === 'text'; }).map(function (b) { return b.text; }).join(''));
+  var V = ['ผ่าน', 'ไม่ผ่าน', 'ไม่พบข้อมูล', 'ไม่เกี่ยวข้อง'];
+  var items = crit.map(function (c, i) {
+    var m = (out.items || []).filter(function (x) { return String(x.cl) === String(c.cl) && (!x.mat || x.mat === c.mat); })[0] || (out.items || [])[i] || {};
+    return { key: c.key, cl: c.cl, mat: c.mat, req: c.req, found: String(m.found || 'AI ไม่ได้ตอบข้อนี้').slice(0, 300), verdict: V.indexOf(m.verdict) >= 0 ? m.verdict : 'ไม่พบข้อมูล' };
+  });
+  var rel = items.filter(function (x) { return x.verdict !== 'ไม่เกี่ยวข้อง'; });
+  var overall = !rel.length ? 'more_docs' : rel.some(function (x) { return x.verdict === 'ไม่ผ่าน'; }) ? 'rejected' : rel.some(function (x) { return x.verdict === 'ไม่พบข้อมูล'; }) ? 'more_docs' : 'approved';
+  s.ai = { items: items, summary: String(out.summary || '').slice(0, 1500), overall: overall, model: cfg.model || AI_DEFAULT_MODEL, at: new Date().toISOString(), files: files.length, usage: data.usage || null };
+  s.updated = new Date().toISOString(); await DB.put('submittals', s);
+  return s;
+}
+var AI_OVR = { approved: { k: 'ok', t: 'AI แนะนำ: อนุมัติได้' }, more_docs: { k: 'warn', t: 'AI แนะนำ: ขอเอกสารเพิ่มเติม' }, rejected: { k: 'bad', t: 'AI แนะนำ: ไม่อนุมัติ' } };
+function aiCard(s, cfg) {
+  var ai = s.ai, nF = filesOf('submittal', s.id).length, nC = criteriaOf(s).length, ready = cfg.key && !aiSandboxed();
+  var h = '<div class="card"><div class="card-h"><h2>ตรวจเบื้องต้นด้วย AI</h2>' + (ready ? '<button class="btn acc" data-act="aiRun" ' + (nF && nC ? '' : 'disabled') + '>' + ic('spark') + (ai ? 'ตรวจใหม่' : 'ตรวจด้วย AI') + '</button>' : '') + '</div>';
+  if (aiSandboxed()) h += '<p class="muted">AI ใช้ได้เมื่อเปิดแอปจาก GitHub Pages ที่ติดตั้งแล้ว (หน้าทดลองใน claude.ai ไม่อนุญาตให้เชื่อมต่อภายนอก)</p>';
+  else if (!cfg.key) h += '<p class="muted">ยังไม่ได้เปิดใช้ – ใส่ API key ของ Anthropic ที่ <a href="#/app">ตั้งค่าแอป</a></p>';
+  else if (!nF || !nC) h += '<p class="muted">ต้องมีไฟล์แนบและเกณฑ์ที่ใช้ตรวจก่อน</p>';
+  else h += '<p class="muted">ส่งไฟล์แนบ ' + nF + ' ไฟล์ให้ AI เทียบกับข้อกำหนด ' + Math.min(nC, 60) + ' ข้อ • ใช้เวลาประมาณ 20–60 วินาที • มีค่าใช้จ่าย API ต่อครั้ง</p>';
+  if (ai) {
+    var cnt = function (v) { return ai.items.filter(function (x) { return x.verdict === v; }).length; };
+    h += '<div class="row" style="margin:6px 0">' + badge(AI_OVR[ai.overall] || { k: 'na', t: ai.overall }) + '<span class="muted">ผ่าน ' + cnt('ผ่าน') + ' • ไม่ผ่าน ' + cnt('ไม่ผ่าน') + ' • ไม่พบข้อมูล ' + cnt('ไม่พบข้อมูล') + ' • ไม่เกี่ยวข้อง ' + cnt('ไม่เกี่ยวข้อง') + '</span>' +
+      '<button class="btn sm sec" data-act="aiApply">นำผล AI ไปใส่ในช่องที่ยังไม่ตรวจ</button></div><p><b>สรุป:</b> ' + esc(ai.summary || '-') + '</p>' +
+      '<div class="tw"><table class="tbl"><thead><tr><th>ข้อ</th><th>ข้อกำหนด</th><th>สิ่งที่พบ</th><th>ผล</th></tr></thead><tbody>' + ai.items.map(function (x) {
+        return '<tr><td>' + esc(x.cl) + '</td><td>' + esc(x.req) + '</td><td>' + esc(x.found) + '</td><td class="v-' + esc(x.verdict) + ' nowrap">' + esc(x.verdict) + '</td></tr>'; }).join('') + '</tbody></table></div>' +
+      '<p class="muted">ตรวจเมื่อ ' + th(ai.at.slice(0, 10), true) + ' ' + ai.at.slice(11, 16) + ' • ' + esc(ai.model) + ' • ผลจาก AI เป็นการคัดกรองเบื้องต้น ผู้ควบคุมงานต้องตรวจเอกสารจริงก่อนอนุมัติ</p>';
+  }
+  return h + '</div>';
+}
 

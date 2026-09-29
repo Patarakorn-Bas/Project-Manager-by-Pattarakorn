@@ -1,5 +1,5 @@
 {
-  "name": "คุมงานก่อสร้าง – รายงานประจำวัน รายสัปดาห์ และขออนุมัติวัสดุ",
+  "name": "ระบบควบคุมงานก่อสร้าง",
   "short_name": "คุมงาน",
   "description": "ติดตามความก้าวหน้างานก่อสร้าง S-Curve รายงานประจำวัน/รายสัปดาห์ และตรวจขออนุมัติวัสดุ ใช้งานออฟไลน์ได้",
   "lang": "th",
@@ -7,7 +7,7 @@
   "scope": "./",
   "display": "standalone",
   "background_color": "#f2f5f9",
-  "theme_color": "#1B4F9C",
+  "theme_color": "#0e2548",
   "icons": [
     { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
     { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
